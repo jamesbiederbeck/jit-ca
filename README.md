@@ -48,6 +48,8 @@ Compose publishes **loopback-only** ports and uses a named state volume. `demo.p
 ## How it works
 
 - **DNS:** UDP/15353. A query for an explicitly allowlisted endpoint gets the configured gateway IPv4 address and queues one nonblocking issuance request. AAAA queries get NODATA (no IPv6 support in the POC) and still queue prewarming. Other hostnames get DNS `REFUSED`; **this is not a general DNS resolver or forwarder**. Never configure it as the household's default resolver.
+
+DNS A answers default to the service's TLS bind address. For a wildcard bind (`0.0.0.0`), the service uses the local interface address selected by the route to the DNS client, without sending a probe packet. Set `network.redirect_ipv4` to override this, especially behind NAT or container port mappings: the service cannot infer the host's externally reachable address. AAAA remains NODATA.
 - **Certificate worker:** Single process, queue-based prewarming; deduplicates pending hostname jobs and uses a lock around issuance. Certs survive restarts under `state/certificates/`.
 - **Cache validation:** Cached leaves must match their private key, issuer signature, exact hostname and current validity window. Renewal begins within the last tenth of the leaf validity window (at most one day); issuer-limited leaves are reused until expiry when renewal cannot extend their lifetime. Issuer-chain validity is checked on every lookup, including cached TLS contexts.
 - **TLS server:** TCP/18443. `SSLContext.sni_callback` selects a prewarmed certificate or signs a leaf during the handshake on cache miss. SNI must match an explicitly configured hostname. Unknown SNI aborts the handshake.

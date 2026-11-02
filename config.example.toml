@@ -5,7 +5,9 @@ dns_host = "127.0.0.1"
 dns_port = 15353
 tls_host = "127.0.0.1"
 tls_port = 18443
-redirect_ipv4 = "127.0.0.1"
+# DNS A answers default to the service's TLS bind/interface address.
+# Override for NAT, containers, or a different externally reachable gateway:
+# redirect_ipv4 = "192.0.2.10"
 allowed_clients = ["127.0.0.1/32", "::1/128"]
 
 [certificates]

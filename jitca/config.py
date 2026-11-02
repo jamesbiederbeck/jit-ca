@@ -52,7 +52,7 @@ class Config:
     dns_port: int
     tls_host: str
     tls_port: int
-    redirect_ipv4: str
+    redirect_ipv4: str | None
     allowed_client_networks: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]
     endpoints: dict[str, Endpoint]
     issuer_mode: str
@@ -108,8 +108,10 @@ def load_config(filename: str | Path) -> Config:
 
     allowed = tuple(ipaddress.ip_network(x, strict=False)
                     for x in net.get("allowed_clients", ["127.0.0.1/32", "::1/128"]))
-    redirect = net.get("redirect_ipv4", "127.0.0.1")
-    ipaddress.IPv4Address(redirect)
+    redirect = net.get("redirect_ipv4")
+    if redirect is not None:
+        if ipaddress.IPv4Address(redirect).is_unspecified:
+            raise ValueError("redirect_ipv4 must be a concrete IPv4 address")
     state = (path.parent / cert.get("state_dir", "./state")).resolve()
     leaf_days = int(cert.get("leaf_days", 30))
     if not 1 <= leaf_days <= 197:

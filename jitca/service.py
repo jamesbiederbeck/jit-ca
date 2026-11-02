@@ -5,6 +5,7 @@ import ipaddress
 import json
 from pathlib import Path
 import queue
+import socket
 import socketserver
 import ssl
 import struct
@@ -120,14 +121,22 @@ def _parse_dns_question(payload: bytes):
     return ident, flags, hostname, qtype, qclass, payload[12:question_end+4]
 
 
-def _dns_response(payload: bytes, config: Config):
+def _dns_response(payload: bytes, config: Config, client_ip: str = "127.0.0.1"):
     ident, flags, hostname, qtype, qclass, question = _parse_dns_question(payload)
     approved = hostname in config.endpoints
     rcode = 0 if approved else 5  # REFUSED for unknown hostnames (no forwarding in POC).
     answer = b""
     if approved and qtype == 1 and qclass == 1:
         answer = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 30, 4)
-        answer += ipaddress.IPv4Address(config.redirect_ipv4).packed
+        redirect = config.redirect_ipv4
+        if redirect is None:
+            redirect = socket.gethostbyname(config.tls_host)
+            if ipaddress.IPv4Address(redirect).is_unspecified:
+                # Route lookup only: UDP connect sends no packet.
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                    probe.connect((client_ip, 9))
+                    redirect = probe.getsockname()[0]
+        answer += ipaddress.IPv4Address(redirect).packed
     reply_flags = 0x8000 | 0x0400 | (flags & 0x0100) | rcode
     header = struct.pack("!HHHHHH", ident, reply_flags, 1, int(bool(answer)), 0, 0)
     return header + question + answer, hostname, approved, qtype
@@ -141,8 +150,8 @@ class _DNSHandler(socketserver.BaseRequestHandler):
             controller.log.emit("dns_denied", source=self.client_address[0])
             return
         try:
-            response, hostname, approved, qtype = _dns_response(data, controller.config)
-        except (ValueError, UnicodeDecodeError) as exc:
+            response, hostname, approved, qtype = _dns_response(data, controller.config, self.client_address[0])
+        except (ValueError, UnicodeDecodeError, OSError) as exc:
             controller.log.emit("dns_invalid", source=self.client_address[0], error=str(exc))
             return
         controller.log.emit("dns_query", source=self.client_address[0], hostname=hostname,
