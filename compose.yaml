@@ -1,0 +1,19 @@
+services:
+  jitca:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:15353:15353/udp"
+      - "127.0.0.1:18443:18443/tcp"
+    volumes:
+      - jitca_state:/state
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+
+volumes:
+  jitca_state:

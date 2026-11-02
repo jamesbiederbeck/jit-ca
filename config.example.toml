@@ -1,0 +1,42 @@
+# Only explicitly configured hostnames receive answers/certificates.
+# Bind to loopback by default. Do not expose directly to the internet.
+[network]
+dns_host = "127.0.0.1"
+dns_port = 15353
+tls_host = "127.0.0.1"
+tls_port = 18443
+redirect_ipv4 = "127.0.0.1"
+allowed_clients = ["127.0.0.1/32", "::1/128"]
+
+[certificates]
+mode = "local"                  # use a locally generated DEMO CA
+state_dir = "./state"
+leaf_days = 30
+leaf_key = "rsa2048"             # or p256
+
+# Optional experimental external issuer with your own CA material:
+# mode = "external"
+# issuer_cert = "issuer/issuer.crt"
+# issuer_key = "issuer/issuer.key"
+# chain_files = ["issuer/parent.crt"]
+# WARNING: does not bypass pinning, mTLS, revocation or expiry.
+
+[http]
+max_body_bytes = 65536
+
+[[endpoints]]
+hostname = "robot.example.test"
+
+[[endpoints.routes]]
+method = "GET"
+path = "/status"
+status = 200
+content_type = "application/json"
+body = '{"robot":{"connected":true,"mode":"idle"},"source":"jitca"}'
+
+[[endpoints.routes]]
+method = "POST"
+path = "/commands"
+status = 202
+content_type = "application/json"
+body = '{"accepted":true,"source":"jitca"}'
