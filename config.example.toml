@@ -25,9 +25,13 @@ leaf_key = "rsa2048"             # or p256
 
 [http]
 max_body_bytes = 65536
+backend_timeout_seconds = 5
+max_response_bytes = 1048576
 
 [[endpoints]]
 hostname = "robot.example.test"
+# With no routes, every request is logged, answered with empty 204, and closed.
+# These optional fixtures demonstrate how to start building a local API.
 
 [[endpoints.routes]]
 method = "GET"
@@ -42,3 +46,10 @@ path = "/commands"
 status = 202
 content_type = "application/json"
 body = '{"accepted":true,"source":"jitca"}'
+
+# Optional backend directive, scoped to this hostname and a path prefix.
+# The backend can be your own Python app, nginx, Apache, or another emulator.
+# [[endpoints.routes]]
+# path_prefix = "/api/"
+# proxy_pass = "http://127.0.0.1:9000"
+# headers = { X-Emulator = "local" }

@@ -11,7 +11,8 @@ import ssl
 import struct
 import threading
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
+from http.client import HTTPException
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -21,6 +22,7 @@ from cryptography.x509.oid import NameOID
 from .certs import CertificateStore, _save_private, _private_pem
 from .config import Config, canonical_hostname
 from .events import EventLog
+from .http import Response, encode_response, respond, select_route
 
 
 class CertificatePrewarmer:
@@ -190,20 +192,22 @@ def _bootstrap_context(path: Path) -> ssl.SSLContext:
     return context
 
 
+def _redact(value):
+    if isinstance(value, dict):
+        return {k: "[REDACTED]" if any(p in k.lower() for p in (
+            "pass", "secret", "token", "auth", "cookie", "credential", "apikey", "api_key"))
+            else _redact(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact(v) for v in value[:50]]
+    return value
+
+
 def _safe_preview(body: bytes):
     if not body:
         return ""
     try:
         payload = json.loads(body)
-        def redact(value):
-            if isinstance(value, dict):
-                return {k: "[REDACTED]" if any(p in k.lower() for p in (
-                    "pass", "secret", "token", "auth", "cookie", "credential", "apikey", "api_key"))
-                    else redact(v) for k, v in value.items()}
-            if isinstance(value, list):
-                return [redact(v) for v in value[:50]]
-            return value
-        return json.dumps(redact(payload), ensure_ascii=False)[:4096]
+        return json.dumps(_redact(payload), ensure_ascii=False)[:4096]
     except (ValueError, UnicodeDecodeError):
         return "[non-JSON body omitted]"
 
@@ -216,6 +220,8 @@ def _read_http(stream, max_body):
     if len(parts) != 3 or not parts[2].startswith("HTTP/1."):
         raise ValueError("unsupported HTTP request")
     method, target, version = parts
+    if not target.startswith("/") or target.startswith("//") or "#" in target:
+        raise ValueError("request target must be an origin-form path")
     headers, total = {}, 0
     for _ in range(100):
         line = stream.readline(8193)
@@ -272,30 +278,30 @@ class _TLSHandler(socketserver.BaseRequestHandler):
                 raise ValueError("no selected hostname")
             stream = wrapped.makefile("rb")
             method, target, version, headers, request_body = _read_http(stream, ctrl.config.max_body_bytes)
+            parsed = urlsplit(target)
+            parameters = _redact(parse_qs(parsed.query, keep_blank_values=True, max_num_fields=1000))
+            public_headers = _redact(headers)
+            request_details = dict(source=client_ip, hostname=hostname, method=method,
+                                   path=parsed.path, query_parameters=parameters,
+                                   request_headers=public_headers, request_bytes=len(request_body),
+                                   request_sha256=hashlib.sha256(request_body).hexdigest(),
+                                   request_preview=_safe_preview(request_body))
+            ctrl.log.emit("http_request", **request_details)
             host_header = headers.get("host", "")
             # Host and SNI must match; no cross-vhost routing.
-            if host_header.split(":")[0].lower() != hostname:
-                status, body, typ = 403, b'{"error":"Host/SNI mismatch"}', "application/json"
+            if canonical_hostname(host_header.split(":")[0]) != hostname:
+                result = Response(403, b'{"error":"Host/SNI mismatch"}', {"content-type": "application/json"})
             else:
-                route_path = urlsplit(target).path
-                route = next((x for x in ctrl.config.endpoints[hostname].routes
-                              if x.method == method and x.path == route_path), None)
-                if route is None:
-                    status, body, typ = 404, b'{"error":"unimplemented endpoint"}', "application/json"
-                else:
-                    status, body, typ = route.status, route.body.encode("utf-8"), route.content_type
-            response = _http_response(status, body, typ)
-            wrapped.sendall(response)
-            public_headers = {k: ("[REDACTED]" if k in (
-                "authorization", "cookie", "proxy-authorization", "x-api-key", "x-auth-token") else v)
-                for k, v in headers.items()}
-            ctrl.log.emit("http_flow", source=client_ip, hostname=hostname,
-                          method=method, path=urlsplit(target).path, status=status,
+                route = select_route(ctrl.config.endpoints[hostname], method, parsed.path)
+                try:
+                    result = respond(ctrl.config, route, method, target, headers, request_body)
+                except (HTTPException, OSError, ValueError) as exc:
+                    ctrl.log.emit("backend_error", hostname=hostname, path=parsed.path, error=str(exc))
+                    result = Response(502, b'{"error":"backend unavailable"}', {"content-type": "application/json"})
+            wrapped.sendall(encode_response(result, method))
+            ctrl.log.emit("http_flow", **request_details, status=result.status,
                           tls_version=wrapped.version(), cipher=wrapped.cipher()[0],
-                          request_headers=public_headers, request_bytes=len(request_body),
-                          request_sha256=hashlib.sha256(request_body).hexdigest(),
-                          request_preview=_safe_preview(request_body),
-                          response_preview=_safe_preview(body))
+                          response_preview=_safe_preview(result.body))
         except (ssl.SSLError, OSError, ValueError, UnicodeError) as exc:
             ctrl.log.emit("tls_or_http_error", source=client_ip, error=str(exc))
             if wrapped is not None:

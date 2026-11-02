@@ -9,6 +9,7 @@ Start by reading `README.md` and `CODEX_HANDOFF.md`. Treat them as the current i
 - `jitca/certs.py`: issuer setup, PEM validation, signed leaf generation, persistent cache.
 - `jitca/service.py`: DNS listener, certificate prewarming, SNI TLS server, simple HTTP response handler and capture logging.
 - `jitca/events.py`: asynchronous JSONL event writer, queue draining and storage error reporting.
+- `jitca/http.py`: hostname/path rule selection, static fixtures and explicit HTTP(S) backend forwarding.
 - `jitca/config.py`: TOML configuration and policy checks.
 - `jitca/cli.py`: Typer CLI.
 - `tests/test_e2e.py`: integration tests that exercise real loopback DNS and TLS.

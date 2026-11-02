@@ -2,7 +2,7 @@
 
 An intentionally narrow **working vertical slice** of the JIT CA design:
 
-`DNS A/AAAA query → async cert prewarm → persistent cache → TLS SNI certificate selection → static local HTTP emulator → JSONL event log`
+`DNS A/AAAA query → async cert prewarm → persistent cache → TLS SNI certificate selection → observe request → fixture/backend/empty response → close connection`
 
 Requires Python **3.11+** and `cryptography`. All code is Python; there are no shell dependencies except optional `openssl` for inspection. Uses a **newly generated local test CA** by default. No compromised private keys are packaged or downloaded.
 
@@ -54,7 +54,7 @@ DNS A answers default to the service's TLS bind address. For a wildcard bind (`0
 - **Cache validation:** Cached leaves must match their private key, issuer signature, exact hostname and current validity window. Renewal begins within the last tenth of the leaf validity window (at most one day); issuer-limited leaves are reused until expiry when renewal cannot extend their lifetime. Issuer-chain validity is checked on every lookup, including cached TLS contexts.
 - **TLS server:** TCP/18443. `SSLContext.sni_callback` selects a prewarmed certificate or signs a leaf during the handshake on cache miss. SNI must match an explicitly configured hostname. Unknown SNI aborts the handshake.
 - **Issuer:** `local` mode creates a demo P-256 CA with `keyCertSign` and CA extensions, then RSA-2048 leafs by default. `external` loads your own issuer certificate/key and optional ordered chain. Certificate expiration is limited by issuer-chain `notAfter`. This is not a publicly trusted CA.
-- **Emulator:** HTTP/1.1 with static method/path response mappings. Unknown paths return JSON 404 and are recorded for exploration. HTTP Host must match TLS SNI.
+- **Emulator:** After TLS, read and log one HTTP/1.1 request, select a hostname/path rule, send its response, then close the connection. With no matching rule, return an empty **204 No Content**. HTTP Host must match TLS SNI. No forwarding happens unless a rule explicitly sets `proxy_pass`.
 - **Capture:** `state/events.jsonl` records DNS observations, issuance, TLS selection, HTTP method/path/status, negotiated TLS version/cipher, body SHA-256 and a **redacted JSON preview**. Authorization and cookie headers are redacted. Raw binary bodies are deliberately not saved.
 
 Network handlers and the certificate worker enqueue observations in memory; a dedicated writer serializes and appends them to JSONL. Slow disk writes do not hold up DNS replies or TLS selection. Events become visible asynchronously, and graceful shutdown flushes the queue. A writer failure is reported as an error during shutdown. The queue is currently unbounded, so prolonged slow storage can increase memory use; this remains a lab POC rather than a high-volume capture service.
@@ -70,6 +70,42 @@ Shutdown waits for active work rather than abandoning threads after a fixed dead
 See [`config.example.toml`](config.example.toml). Change only the endpoint hostname(s) and static response fixtures to emulate different services. Every hostname must be explicitly listed: no wildcard or unconstrained certificate issuance.
 
 Hostnames normalize case, internationalized names (IDNA), and a single trailing DNS dot. Wildcards, IP literals, whitespace, empty labels and labels with invalid characters or leading/trailing hyphens are rejected.
+
+### HTTP response and backend directives
+
+The existing Python TLS server remains the transport. TOML endpoint and route blocks provide virtual-host and location rules similar to nginx or Apache; they are not nginx/Apache configuration files. Start with only a hostname to observe requests with empty 204 responses, then add fixtures or point selected paths to a local application:
+
+```toml
+[http]
+max_body_bytes = 65536
+backend_timeout_seconds = 5
+max_response_bytes = 1048576
+
+[[endpoints]]
+hostname = "robot.example.test"
+
+# Exact path, any method unless method is specified.
+[[endpoints.routes]]
+path = "/status"
+method = "GET"
+status = 200
+content_type = "application/json"
+body = '{"connected":true,"mode":"idle"}'
+headers = { X-Emulator = "jitca" }
+
+# Forward the original path and query to your explicitly chosen backend.
+[[endpoints.routes]]
+path_prefix = "/api/"
+proxy_pass = "http://127.0.0.1:9000"
+
+# Add another [[endpoints]] block for a different hostname/API.
+```
+
+Each route must have exactly one `path` (exact) or `path_prefix` (literal prefix). Matching exact routes win over prefixes, then the longest prefix wins. For the same path match, a specific `method` wins over `"*"` (the default). Query parameters do not affect path matching and are forwarded unchanged to backends. Existing method/path fixtures remain valid. Use a `path_prefix = "/"` static rule for a custom fallback instead of the default 204.
+
+A static rule accepts `status` (200–599), `body`, `content_type` and optional response `headers`. `proxy_pass` accepts an HTTP(S) **origin only**, without a URL path, query or credentials; it forwards the original method, path, query, headers and body to that fixed origin. Combine it with response `headers`, but not static response fields. This supports an arbitrary local API backend without implementing its business logic in JIT CA. HTTPS backend certificates are verified using the system trust store. Backend failures, timeouts and oversized responses return 502. Hop-by-hop headers are removed, backend Host is rewritten, and the client connection closes after the response. Backend bodies are buffered up to `max_response_bytes`; streaming protocols remain unsupported.
+
+`http_request` events record method, hostname, path, repeated query parameters, redacted headers and a redacted JSON body preview before response selection. `http_flow` records the response status and preview. Sensitive query names such as `token`, `password` and `api_key` use the same redaction policy as JSON fields. Arbitrary binary or non-JSON request bodies are hashed but not persisted. Logs are asynchronous as described above.
 
 ### External issuer profile (experimental)
 
@@ -121,6 +157,6 @@ This is **not yet a replacement for mitmproxy, Squid, or roomba-cloud**. Specifi
 
 ### Next integration milestone
 
-Replace the static-response handler with a protocol adapter. Add an addon for **mitmproxy** as an optional HTTP/TLS transport, but first confirm that its certificate-store injection API permits DNS prewarming without duplicating mitmproxy's existing eMudhra certificate machinery. Deploy DNS observation through CoreDNS (or a local resolver plugin) so non-intercepted names resolve normally.
+The HTTP rule dispatcher is separated from the TLS listener. Extend it with stateful local API handlers, and consider **mitmproxy** as an optional HTTP/TLS transport after confirming its certificate-store injection API permits DNS prewarming. Deploy DNS observation through CoreDNS (or a local resolver plugin) so non-intercepted names resolve normally.
 
 The POC establishes the critical sequencing claim: DNS prewarming can produce a certificate **before** the device's TLS `ClientHello`, and SNI can select that certificate **without** generating it during the handshake.
