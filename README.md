@@ -55,6 +55,14 @@ Compose publishes **loopback-only** ports and uses a named state volume. `demo.p
 - **Emulator:** HTTP/1.1 with static method/path response mappings. Unknown paths return JSON 404 and are recorded for exploration. HTTP Host must match TLS SNI.
 - **Capture:** `state/events.jsonl` records DNS observations, issuance, TLS selection, HTTP method/path/status, negotiated TLS version/cipher, body SHA-256 and a **redacted JSON preview**. Authorization and cookie headers are redacted. Raw binary bodies are deliberately not saved.
 
+Network handlers and the certificate worker enqueue observations in memory; a dedicated writer serializes and appends them to JSONL. Slow disk writes do not hold up DNS replies or TLS selection. Events become visible asynchronously, and graceful shutdown flushes the queue. A writer failure is reported as an error during shutdown. The queue is currently unbounded, so prolonged slow storage can increase memory use; this remains a lab POC rather than a high-volume capture service.
+
+### Service lifecycle
+
+`stop()` stops accepting requests, waits for active DNS/TLS handlers, drains queued certificate jobs, then writes the final `service_stopped` event and closes the log. TLS request streams and sockets are closed after both successful requests and failed handshakes. Failed construction or partial startup releases listeners and workers already created. Stopping before startup and repeated stops are safe; restarting requires a new service instance.
+
+Shutdown waits for active work rather than abandoning threads after a fixed deadline. TLS socket operations retain the existing eight-second timeout, but signing and storage operations have no forced shutdown timeout. Use graceful shutdown to preserve queued observations; terminating the process abruptly can lose events still in memory.
+
 ## Example configuration
 
 See [`config.example.toml`](config.example.toml). Change only the endpoint hostname(s) and static response fixtures to emulate different services. Every hostname must be explicitly listed: no wildcard or unconstrained certificate issuance.
@@ -93,6 +101,8 @@ pytest -q
 ```
 
 Integration tests start real UDP/TCP listeners on ephemeral loopback ports and verify **certificate issuance on DNS query, certificate cache reuse, verified TLS handshakes, synthetic responses, SNI fallback, refused hostnames, HTTP host/SNI enforcement, redacted logs, and persisted certs.**
+
+Regression tests also cover slow logging without delayed DNS/TLS responses, shutdown during signing and HTTP handling, failed startup cleanup, failed TLS handshake cleanup, and log writer errors.
 
 ## Current limitations (deliberate)
 

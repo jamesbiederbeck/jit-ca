@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
-import os
 from pathlib import Path
 import queue
 import socketserver
@@ -20,24 +19,7 @@ from cryptography.x509.oid import NameOID
 
 from .certs import CertificateStore, _save_private, _private_pem
 from .config import Config, canonical_hostname
-
-
-class EventLog:
-    def __init__(self, path: Path):
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.path = path
-        self._lock = threading.Lock()
-        descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-        self._stream = os.fdopen(descriptor, "a", buffering=1)
-
-    def emit(self, event: str, **details) -> None:
-        with self._lock:
-            self._stream.write(json.dumps({"time": datetime.now(timezone.utc).isoformat(),
-                                           "event": event, **details}, default=str) + "\n")
-
-    def close(self):
-        with self._lock:
-            self._stream.close()
+from .events import EventLog
 
 
 class CertificatePrewarmer:
@@ -47,13 +29,24 @@ class CertificatePrewarmer:
         self.queue: queue.Queue[str | None] = queue.Queue()
         self.pending: set[str] = set()
         self.lock = threading.Lock()
+        self._started = False
+        self._stopped = False
         self.thread = threading.Thread(target=self._work, name="jitca-cert-prewarm", daemon=True)
 
     def start(self):
-        self.thread.start()
+        with self.lock:
+            if self._started or self._stopped:
+                raise RuntimeError("certificate worker cannot be restarted")
+            self.thread.start()
+            self._started = True
 
     def request(self, hostname: str):
+        hostname = canonical_hostname(hostname)
+        if hostname not in self.store.config.endpoints:
+            raise PermissionError(f"hostname not approved: {hostname}")
         with self.lock:
+            if not self._started or self._stopped:
+                raise RuntimeError("certificate worker is not running")
             if hostname not in self.pending:
                 self.pending.add(hostname)
                 self.queue.put(hostname)
@@ -76,8 +69,13 @@ class CertificatePrewarmer:
                 self.queue.task_done()
 
     def stop(self):
-        self.queue.put(None)
-        self.thread.join(timeout=5)
+        with self.lock:
+            if not self._stopped:
+                self._stopped = True
+                if self._started:
+                    self.queue.put(None)
+        if self._started:
+            self.thread.join()
 
 
 def _parse_dns_question(payload: bytes):
@@ -156,7 +154,7 @@ class _DNSHandler(socketserver.BaseRequestHandler):
 
 class _DNSServer(socketserver.ThreadingUDPServer):
     allow_reuse_address = True
-    daemon_threads = True
+    daemon_threads = False  # server_close waits for handlers before their dependencies close.
 
     def __init__(self, address, controller):
         super().__init__(address, _DNSHandler)
@@ -256,10 +254,11 @@ class _TLSHandler(socketserver.BaseRequestHandler):
             return
         self.request.settimeout(8)
         wrapped = None
+        stream = None
         try:
-            wrapped = ctrl.base_ssl.wrap_socket(self.request, server_side=True, do_handshake_on_connect=True)
-            with ctrl.selected_lock:
-                hostname = ctrl.selected.pop(wrapped.fileno(), None)
+            wrapped = ctrl.base_ssl.wrap_socket(self.request, server_side=True, do_handshake_on_connect=False)
+            wrapped.do_handshake()
+            hostname = getattr(wrapped, "_jitca_hostname", None)
             if hostname is None:
                 raise ValueError("no selected hostname")
             stream = wrapped.makefile("rb")
@@ -296,15 +295,15 @@ class _TLSHandler(socketserver.BaseRequestHandler):
                 except OSError:
                     pass
         finally:
+            if stream is not None:
+                stream.close()
             if wrapped is not None:
                 wrapped.close()
-            with ctrl.selected_lock:
-                ctrl.selected.pop(self.request.fileno(), None)
 
 
 class _TLSServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
-    daemon_threads = True
+    daemon_threads = False
 
     def __init__(self, address, controller):
         super().__init__(address, _TLSHandler)
@@ -316,15 +315,25 @@ class JITCAService:
         self.config = config
         config.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.log = EventLog(config.state_dir / "events.jsonl")
-        self.store = CertificateStore(config)
-        self.prewarmer = CertificatePrewarmer(self.store, self.log)
-        self.selected: dict[int, str] = {}
-        self.selected_lock = threading.Lock()
-        self.base_ssl = _bootstrap_context(config.state_dir / "certificates")
-        self.base_ssl.sni_callback = self._sni_callback
-        self.dns_server = _DNSServer((config.dns_host, config.dns_port), self)
-        self.tls_server = _TLSServer((config.tls_host, config.tls_port), self)
+        self._lifecycle_lock = threading.RLock()
+        self._state = "new"
+        self._servers = []
+        self._running_servers = []
         self.threads: list[threading.Thread] = []
+        try:
+            self.store = CertificateStore(config)
+            self.prewarmer = CertificatePrewarmer(self.store, self.log)
+            self.base_ssl = _bootstrap_context(config.state_dir / "certificates")
+            self.base_ssl.sni_callback = self._sni_callback
+            self.dns_server = _DNSServer((config.dns_host, config.dns_port), self)
+            self._servers.append(self.dns_server)
+            self.tls_server = _TLSServer((config.tls_host, config.tls_port), self)
+            self._servers.append(self.tls_server)
+        except BaseException:
+            for server in reversed(self._servers):
+                server.server_close()
+            self.log.close()
+            raise
 
     @property
     def dns_address(self):
@@ -348,27 +357,42 @@ class JITCAService:
         try:
             context, issued = self.store.ssl_context(hostname)
             ssl_obj.context = context
-            with self.selected_lock:
-                self.selected[ssl_obj.fileno()] = hostname
+            ssl_obj._jitca_hostname = hostname
             self.log.emit("tls_certificate_selected", hostname=hostname, new=issued)
         except Exception as exc:
             self.log.emit("tls_cert_error", hostname=hostname, error=str(exc))
             return ssl.ALERT_DESCRIPTION_INTERNAL_ERROR
 
     def start(self):
-        self.prewarmer.start()
-        for name, server in (("jitca-dns", self.dns_server), ("jitca-tls", self.tls_server)):
-            thread = threading.Thread(target=server.serve_forever, name=name, daemon=True)
-            thread.start()
-            self.threads.append(thread)
-        self.log.emit("service_started", dns_address=self.dns_address, tls_address=self.tls_address)
+        with self._lifecycle_lock:
+            if self._state != "new":
+                raise RuntimeError("service can only be started once")
+            self._state = "running"
+            try:
+                self.prewarmer.start()
+                for name, server in (("jitca-dns", self.dns_server), ("jitca-tls", self.tls_server)):
+                    thread = threading.Thread(target=server.serve_forever,
+                                              kwargs={"poll_interval": 0.1}, name=name, daemon=True)
+                    thread.start()
+                    self.threads.append(thread)
+                    self._running_servers.append(server)
+                self.log.emit("service_started", dns_address=self.dns_address, tls_address=self.tls_address)
+            except BaseException:
+                self.stop()
+                raise
 
     def stop(self):
-        for server in (self.dns_server, self.tls_server):
-            server.shutdown()
-            server.server_close()
-        self.prewarmer.stop()
-        for thread in self.threads:
-            thread.join(timeout=5)
-        self.log.emit("service_stopped")
-        self.log.close()
+        with self._lifecycle_lock:
+            if self._state == "stopped":
+                return
+            # Stop accepting first, then drain every producer before closing the log.
+            for server in self._running_servers:
+                server.shutdown()
+            for server in self._servers:
+                server.server_close()
+            self.prewarmer.stop()
+            for thread in self.threads:
+                thread.join()
+            self.log.emit("service_stopped")
+            self._state = "stopped"
+            self.log.close()
