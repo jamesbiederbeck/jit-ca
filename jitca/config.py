@@ -3,16 +3,29 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import ipaddress
+import re
 import tomllib
 
 
 def canonical_hostname(raw: str) -> str:
-    name = raw.rstrip(".").strip().lower()
+    name = raw.lower()
+    if name.endswith("."):
+        name = name[:-1]
+    try:
+        name = name.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError("invalid hostname") from exc
     if not name or len(name) > 253:
         raise ValueError("invalid hostname")
-    name = name.encode("idna").decode("ascii")
-    if any(not label or len(label) > 63 for label in name.split(".")):
+    if any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+           for label in name.split(".")):
         raise ValueError("invalid hostname")
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("endpoint must be a DNS hostname, not an IP address")
     return name
 
 

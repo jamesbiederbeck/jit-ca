@@ -93,7 +93,7 @@ def test_dns_prewarm_tls_flow(tmp_path):
         res2, _ = tls_request(server.tls_address[1], server.store.root_ca_path, path="/missing")
         assert b"404 Not Found" in res2
         res3, _ = tls_request(server.tls_address[1], server.store.root_ca_path,
-                              body=b'{"password":"abc","thing":1}', path="/command")
+                                  body=b'{"password":"secret-that-must-never-appear-in-capture","thing":1}', path="/command")
         assert b"202 Accepted" in res3
         # Repeated A/AAAA queries do not duplicate a certificate.
         for _ in range(4):
@@ -114,7 +114,7 @@ def test_dns_prewarm_tls_flow(tmp_path):
     flows = [x for x in events if x["event"] == "http_flow"]
     assert [x["status"] for x in flows] == [200,404,202]
     assert '"password": "[REDACTED]"' in flows[-1]["request_preview"]
-    assert "abc" not in (config.state_dir / "events.jsonl").read_text()
+    assert "secret-that-must-never-appear-in-capture" not in (config.state_dir / "events.jsonl").read_text()
     assert (config.state_dir / "events.jsonl").stat().st_mode & 0o077 == 0
     assert list((config.state_dir / "certificates").glob("*/fullchain.pem"))
 

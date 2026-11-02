@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import ssl
 
 from cryptography import x509
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.x509.oid import NameOID
@@ -116,10 +117,22 @@ class CertificateStore:
         try:
             # Split off the first certificate when a chain is concatenated.
             cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+            key = serialization.load_pem_private_key(key_path.read_bytes(), password=None)
+            if _pub_der(key) != cert.public_key().public_bytes(
+                    serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo):
+                return False
+            cert.verify_directly_issued_by(self.issuer_cert)
             san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
-            remaining = cert.not_valid_after_utc - datetime.now(timezone.utc)
-            return hostname in san.get_values_for_type(x509.DNSName) and remaining > timedelta(days=1)
-        except (ValueError, x509.ExtensionNotFound):
+            now = datetime.now(timezone.utc)
+            remaining = cert.not_valid_after_utc - now
+            lifetime = cert.not_valid_after_utc - cert.not_valid_before_utc
+            renewal_window = min(timedelta(days=1), lifetime / 10)
+            # Reissuing cannot extend an issuer-limited certificate's lifetime.
+            at_issuer_limit = cert.not_valid_after_utc >= self.not_after - timedelta(minutes=1)
+            return (san.get_values_for_type(x509.DNSName) == [hostname]
+                    and cert.not_valid_before_utc <= now < cert.not_valid_after_utc <= self.not_after
+                    and (remaining > renewal_window or at_issuer_limit))
+        except (ValueError, TypeError, OSError, InvalidSignature, x509.ExtensionNotFound):
             return False
 
     def get_or_issue(self, hostname: str) -> tuple[Path, Path, bool]:
@@ -127,6 +140,10 @@ class CertificateStore:
         if hostname not in self.config.endpoints:
             raise PermissionError(f"hostname not approved: {hostname}")
         with self._lock:
+            now = datetime.now(timezone.utc)
+            if any(c.not_valid_before_utc > now or c.not_valid_after_utc <= now
+                   for c in [self.issuer_cert, *self.extra_chain]):
+                raise ValueError("issuer chain not currently within X.509 validity window")
             directory = self._path(hostname)
             cert_path, key_path = directory / "fullchain.pem", directory / "key.pem"
             if self._valid(hostname, cert_path, key_path):
@@ -167,6 +184,7 @@ class CertificateStore:
             return cert_path, key_path, True
 
     def ssl_context(self, hostname: str) -> tuple[ssl.SSLContext, bool]:
+        hostname = canonical_hostname(hostname)
         with self._lock:
             cert_path, key_path, issued = self.get_or_issue(hostname)
             context = self._contexts.get(hostname)

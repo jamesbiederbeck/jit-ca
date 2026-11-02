@@ -49,6 +49,7 @@ Compose publishes **loopback-only** ports and uses a named state volume. `demo.p
 
 - **DNS:** UDP/15353. A query for an explicitly allowlisted endpoint gets the configured gateway IPv4 address and queues one nonblocking issuance request. AAAA queries get NODATA (no IPv6 support in the POC) and still queue prewarming. Other hostnames get DNS `REFUSED`; **this is not a general DNS resolver or forwarder**. Never configure it as the household's default resolver.
 - **Certificate worker:** Single process, queue-based prewarming; deduplicates pending hostname jobs and uses a lock around issuance. Certs survive restarts under `state/certificates/`.
+- **Cache validation:** Cached leaves must match their private key, issuer signature, exact hostname and current validity window. Renewal begins within the last tenth of the leaf validity window (at most one day); issuer-limited leaves are reused until expiry when renewal cannot extend their lifetime. Issuer-chain validity is checked on every lookup, including cached TLS contexts.
 - **TLS server:** TCP/18443. `SSLContext.sni_callback` selects a prewarmed certificate or signs a leaf during the handshake on cache miss. SNI must match an explicitly configured hostname. Unknown SNI aborts the handshake.
 - **Issuer:** `local` mode creates a demo P-256 CA with `keyCertSign` and CA extensions, then RSA-2048 leafs by default. `external` loads your own issuer certificate/key and optional ordered chain. Certificate expiration is limited by issuer-chain `notAfter`. This is not a publicly trusted CA.
 - **Emulator:** HTTP/1.1 with static method/path response mappings. Unknown paths return JSON 404 and are recorded for exploration. HTTP Host must match TLS SNI.
@@ -57,6 +58,8 @@ Compose publishes **loopback-only** ports and uses a named state volume. `demo.p
 ## Example configuration
 
 See [`config.example.toml`](config.example.toml). Change only the endpoint hostname(s) and static response fixtures to emulate different services. Every hostname must be explicitly listed: no wildcard or unconstrained certificate issuance.
+
+Hostnames normalize case, internationalized names (IDNA), and a single trailing DNS dot. Wildcards, IP literals, whitespace, empty labels and labels with invalid characters or leading/trailing hyphens are rejected.
 
 ### External issuer profile (experimental)
 
