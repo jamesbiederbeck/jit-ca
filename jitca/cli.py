@@ -35,10 +35,17 @@ def main(argv=None):
         print(json.dumps(CertificateStore(cfg).all_metadata(), indent=2))
     elif args.command == "issuer":
         store = CertificateStore(cfg)
-        print(json.dumps({"mode": cfg.issuer_mode, "subject": store.issuer_cert.subject.rfc4514_string(),
-                          "not_before": store.issuer_cert.not_valid_before_utc.isoformat(),
-                          "not_after": store.not_after.isoformat(),
-                          "demo_ca_cert": str(store.root_ca_path) if store.root_ca_path else None}, indent=2))
+        if cfg.issuer_mode == "directory":
+            print(json.dumps({"mode": "directory", "ca_dir": str(cfg.ca_dir),
+                              "issuers": {label: {"subject": rec.subject,
+                                                  "not_after": rec.not_after.isoformat()}
+                                         for label, rec in sorted(store.issuers.items())},
+                              "endpoints": {h: store.endpoint_issuer[h] for h in cfg.endpoints}}, indent=2))
+        else:
+            print(json.dumps({"mode": cfg.issuer_mode, "subject": store.issuer_cert.subject.rfc4514_string(),
+                              "not_before": store.issuer_cert.not_valid_before_utc.isoformat(),
+                              "not_after": store.not_after.isoformat(),
+                              "demo_ca_cert": str(store.root_ca_path) if store.root_ca_path else None}, indent=2))
     elif args.command == "events":
         path = cfg.state_dir / "events.jsonl"
         if path.exists():

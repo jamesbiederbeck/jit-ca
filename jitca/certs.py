@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 import threading
 from datetime import datetime, timedelta, timezone
@@ -39,6 +40,86 @@ def _sig_hash(key):
     if isinstance(key, ec.EllipticCurvePrivateKey) and key.key_size >= 384:
         return hashes.SHA384()
     return hashes.SHA256()
+
+
+@dataclass(frozen=True)
+class _Issuer:
+    """A resolved signing identity: a CA certificate, its private key, and any
+    extra certificates to append after it when building a leaf's chain."""
+
+    cert: x509.Certificate
+    key: object
+    chain: tuple[x509.Certificate, ...]
+    issuer_id: str
+    not_after: datetime
+    subject: str
+
+
+def _issuer_id(chain: list[x509.Certificate]) -> str:
+    return hashlib.sha256(b"".join(c.public_bytes(serialization.Encoding.DER) for c in chain)).hexdigest()[:20]
+
+
+def _check_issuer_pair(cert: x509.Certificate, key) -> None:
+    if _pub_der(key) != cert.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo):
+        raise ValueError("issuer key does not match issuer certificate")
+    constraints = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+    if not constraints.ca:
+        raise ValueError("issuer certificate is not a CA")
+    try:
+        if not cert.extensions.get_extension_for_class(x509.KeyUsage).value.key_cert_sign:
+            raise ValueError("issuer certificate lacks keyCertSign")
+    except x509.ExtensionNotFound:
+        pass
+
+
+def _chain_not_after(chain: list[x509.Certificate]) -> datetime:
+    now = datetime.now(timezone.utc)
+    if any(c.not_valid_before_utc > now or c.not_valid_after_utc <= now for c in chain):
+        raise ValueError("issuer chain not currently within X.509 validity window")
+    return min(c.not_valid_after_utc for c in chain)
+
+
+def _load_ca_directory(ca_dir: Path) -> dict[str, _Issuer]:
+    """Load a flat directory of operator-supplied CA cert/key pairs (no manifest).
+
+    Each pair is a `<stem>.pem` certificate and `<stem>.key` private key. The
+    issuer's profile (DV/OV/EV TLS, code-signing, generation/region, ...) is read
+    from the certificate's own subject and extensions, never trusted from the
+    filename, since filenames are for human reference only.
+    """
+    pem_files = sorted(p for p in ca_dir.iterdir() if p.suffix == ".pem")
+    if not pem_files:
+        raise ValueError(f"no .pem issuer certificates found in {ca_dir}")
+    stems = {p.stem for p in pem_files}
+    orphan_keys = {p.stem for p in ca_dir.iterdir() if p.suffix == ".key"} - stems
+    if orphan_keys:
+        raise ValueError(f"private key(s) without matching certificate in {ca_dir}: {sorted(orphan_keys)}")
+    issuers: dict[str, _Issuer] = {}
+    for pem_path in pem_files:
+        key_path = pem_path.with_suffix(".key")
+        if not key_path.exists():
+            raise ValueError(f"missing private key for {pem_path.name}")
+        cert = x509.load_pem_x509_certificate(pem_path.read_bytes())
+        key = serialization.load_pem_private_key(key_path.read_bytes(), password=None)
+        _check_issuer_pair(cert, key)
+        chain = [cert]
+        issuers[pem_path.stem] = _Issuer(cert, key, tuple(), _issuer_id(chain),
+                                         _chain_not_after(chain), cert.subject.rfc4514_string())
+    return issuers
+
+
+def _resolve_endpoint_issuers(cfg: Config, issuers: dict[str, _Issuer]) -> dict[str, str]:
+    endpoint_issuer: dict[str, str] = {}
+    for hostname, endpoint in cfg.endpoints.items():
+        selector = endpoint.issuer or cfg.default_issuer
+        needle = selector.lower()
+        matches = [label for label, rec in issuers.items() if needle in rec.subject.lower()]
+        if len(matches) != 1:
+            raise ValueError(f"issuer selector {selector!r} for endpoint {hostname} "
+                             f"matched {len(matches)} CA(s) in {cfg.ca_dir}")
+        endpoint_issuer[hostname] = matches[0]
+    return endpoint_issuer
 
 
 class CertificateStore:
@@ -81,32 +162,43 @@ class CertificateStore:
             self.issuer_cert = x509.load_pem_x509_certificate(certfile.read_bytes())
             self.issuer_key = serialization.load_pem_private_key(keyfile.read_bytes(), password=None)
             self.extra_chain = []
-        else:
+            _check_issuer_pair(self.issuer_cert, self.issuer_key)
+            chain = [self.issuer_cert]
+            self.not_after = _chain_not_after(chain)
+            self.issuer_id = _issuer_id(chain)
+            issuer = _Issuer(self.issuer_cert, self.issuer_key, tuple(), self.issuer_id,
+                             self.not_after, self.issuer_cert.subject.rfc4514_string())
+            self.issuers = {"local": issuer}
+            self.endpoint_issuer = {hostname: "local" for hostname in cfg.endpoints}
+        elif cfg.issuer_mode == "external":
             self.root_ca_path = None
             self.issuer_cert = x509.load_pem_x509_certificate(cfg.issuer_cert.read_bytes())
             self.issuer_key = serialization.load_pem_private_key(cfg.issuer_key.read_bytes(), password=None)
             self.extra_chain = [x509.load_pem_x509_certificate(f.read_bytes()) for f in cfg.chain_files]
-        if _pub_der(self.issuer_key) != self.issuer_cert.public_key().public_bytes(
-                serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo):
-            raise ValueError("issuer key does not match issuer certificate")
-        constraints = self.issuer_cert.extensions.get_extension_for_class(x509.BasicConstraints).value
-        if not constraints.ca:
-            raise ValueError("issuer certificate is not a CA")
-        try:
-            if not self.issuer_cert.extensions.get_extension_for_class(x509.KeyUsage).value.key_cert_sign:
-                raise ValueError("issuer certificate lacks keyCertSign")
-        except x509.ExtensionNotFound:
-            pass
-        now = datetime.now(timezone.utc)
-        chain = [self.issuer_cert, *self.extra_chain]
-        if any(c.not_valid_before_utc > now or c.not_valid_after_utc <= now for c in chain):
-            raise ValueError("issuer chain not currently within X.509 validity window")
-        self.not_after = min(c.not_valid_after_utc for c in chain)
-        self.issuer_id = hashlib.sha256(b"".join(c.public_bytes(serialization.Encoding.DER)
-                                     for c in chain)).hexdigest()[:20]
+            _check_issuer_pair(self.issuer_cert, self.issuer_key)
+            chain = [self.issuer_cert, *self.extra_chain]
+            self.not_after = _chain_not_after(chain)
+            self.issuer_id = _issuer_id(chain)
+            issuer = _Issuer(self.issuer_cert, self.issuer_key, tuple(self.extra_chain), self.issuer_id,
+                             self.not_after, self.issuer_cert.subject.rfc4514_string())
+            self.issuers = {"external": issuer}
+            self.endpoint_issuer = {hostname: "external" for hostname in cfg.endpoints}
+        else:
+            self.root_ca_path = None
+            self.issuer_cert = None
+            self.issuer_key = None
+            self.extra_chain = []
+            self.not_after = None
+            self.issuer_id = None
+            self.issuers = _load_ca_directory(cfg.ca_dir)
+            self.endpoint_issuer = _resolve_endpoint_issuers(cfg, self.issuers)
+
+    def _issuer_for(self, hostname: str) -> _Issuer:
+        return self.issuers[self.endpoint_issuer[hostname]]
 
     def _path(self, hostname: str) -> Path:
-        digest = hashlib.sha256((hostname + ":" + self.issuer_id + ":" + self.config.leaf_key)
+        issuer = self._issuer_for(hostname)
+        digest = hashlib.sha256((hostname + ":" + issuer.issuer_id + ":" + self.config.leaf_key)
                                 .encode()).hexdigest()
         return self.root / digest
 
@@ -127,6 +219,7 @@ class CertificateStore:
         if hostname not in self.config.endpoints:
             raise PermissionError(f"hostname not approved: {hostname}")
         with self._lock:
+            issuer = self._issuer_for(hostname)
             directory = self._path(hostname)
             cert_path, key_path = directory / "fullchain.pem", directory / "key.pem"
             if self._valid(hostname, cert_path, key_path):
@@ -134,31 +227,32 @@ class CertificateStore:
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             key = rsa.generate_private_key(public_exponent=65537, key_size=2048) if self.config.leaf_key == "rsa2048" else ec.generate_private_key(ec.SECP256R1())
             now = datetime.now(timezone.utc)
-            leaf_end = min(now + timedelta(days=self.config.leaf_days), self.not_after - timedelta(minutes=1))
+            leaf_end = min(now + timedelta(days=self.config.leaf_days), issuer.not_after - timedelta(minutes=1))
             if leaf_end <= now:
                 raise ValueError("issuer expires too soon to issue a certificate")
-            leaf_start = max(now - timedelta(days=2), self.issuer_cert.not_valid_before_utc)
+            leaf_start = max(now - timedelta(days=2), issuer.cert.not_valid_before_utc)
             cert = (x509.CertificateBuilder()
                     .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)]))
-                    .issuer_name(self.issuer_cert.subject).public_key(key.public_key())
+                    .issuer_name(issuer.cert.subject).public_key(key.public_key())
                     .serial_number(x509.random_serial_number())
                     .not_valid_before(leaf_start).not_valid_after(leaf_end)
                     .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
                     .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
-                    .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(self.issuer_key.public_key()), critical=False)
+                    .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(issuer.key.public_key()), critical=False)
                     .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False,
                                    key_encipherment=self.config.leaf_key == "rsa2048", data_encipherment=False, key_agreement=False,
                                    key_cert_sign=False, crl_sign=False, encipher_only=False,
                                    decipher_only=False), critical=True)
                     .add_extension(x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
                     .add_extension(x509.SubjectAlternativeName([x509.DNSName(hostname)]), critical=False)
-                    .sign(self.issuer_key, _sig_hash(self.issuer_key)))
-            chain = [self.issuer_cert, *self.extra_chain] if self.config.issuer_mode == "external" else []
+                    .sign(issuer.key, _sig_hash(issuer.key)))
+            chain = [issuer.cert, *issuer.chain] if self.config.issuer_mode != "local" else []
             chain_pem = cert.public_bytes(serialization.Encoding.PEM) + b"".join(
                 item.public_bytes(serialization.Encoding.PEM) for item in chain)
             _save_private(key_path, _private_pem(key))
             _save_private(cert_path, chain_pem)
-            metadata = json.dumps({"hostname": hostname, "issuer_id": self.issuer_id,
+            metadata = json.dumps({"hostname": hostname, "issuer_id": issuer.issuer_id,
+                                  "issuer_subject": issuer.subject,
                                   "not_before": cert.not_valid_before_utc.isoformat(),
                                   "not_after": cert.not_valid_after_utc.isoformat(),
                                   "fingerprint_sha256": cert.fingerprint(hashes.SHA256()).hex()}, indent=2)

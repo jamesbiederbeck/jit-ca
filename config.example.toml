@@ -21,6 +21,14 @@ leaf_key = "rsa2048"             # or p256
 # chain_files = ["issuer/parent.crt"]
 # WARNING: does not bypass pinning, mTLS, revocation or expiry.
 
+# Optional experimental directory issuer: a flat directory of operator-supplied
+# CA cert/key pairs (no manifest), one profile picked per endpoint:
+# mode = "directory"
+# ca_dir = "issuer/cas"
+# default_issuer = "OV TLS"      # substring matched against each CA's subject DN
+# Per-endpoint override: add `issuer = "EV TLS"` (or similar) to that
+# [[endpoints]] table below. The selector must match exactly one CA's subject.
+
 [http]
 max_body_bytes = 65536
 

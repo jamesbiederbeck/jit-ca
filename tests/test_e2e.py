@@ -161,6 +161,165 @@ def test_http_host_mismatch_rejected(tmp_path):
         service.stop()
 
 
+def _write_ca_pair(ca_dir, stem, subject_cn, days=30):
+    """Write a self-signed CA cert/key pair mimicking an operator-supplied
+    issuer directory entry, with no manifest beyond the matching filenames."""
+    from datetime import datetime, timedelta, timezone
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    now = datetime.now(timezone.utc)
+    key = ec.generate_private_key(ec.SECP384R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, subject_cn),
+                         x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Example Corp"),
+                         x509.NameAttribute(NameOID.COUNTRY_NAME, "US")])
+    cert = (x509.CertificateBuilder().subject_name(subject).issuer_name(subject)
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(days=1)).not_valid_after(now + timedelta(days=days))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False)
+            .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(key.public_key()), False)
+            .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False, key_encipherment=False,
+                                         data_encipherment=False, key_agreement=False, key_cert_sign=True,
+                                         crl_sign=True, encipher_only=False, decipher_only=False), critical=True)
+            .sign(key, hashes.SHA384()))
+    (ca_dir / f"{stem}.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    (ca_dir / f"{stem}.key").write_bytes(key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+    return subject_cn
+
+
+def _directory_config(tmp_path, ca_dir, extra_certificates="", extra_endpoint=""):
+    path = tmp_path / "config.toml"
+    path.write_text(f'''
+[network]
+dns_host = "127.0.0.1"
+dns_port = 0
+tls_host = "127.0.0.1"
+tls_port = 0
+redirect_ipv4 = "127.0.0.1"
+allowed_clients = ["127.0.0.1/32"]
+[certificates]
+mode = "directory"
+ca_dir = "{ca_dir}"
+state_dir = "state"
+leaf_days = 30
+leaf_key = "rsa2048"
+{extra_certificates}
+[[endpoints]]
+hostname = "robot.example.test"
+issuer = "OV TLS"
+[[endpoints.routes]]
+method = "GET"
+path = "/status"
+body = '{{"connected":true}}'
+{extra_endpoint}
+''')
+    return path
+
+
+def test_directory_issuer_selected_per_endpoint(tmp_path):
+    from jitca.certs import CertificateStore
+
+    ca_dir = tmp_path / "cas"
+    ca_dir.mkdir()
+    _write_ca_pair(ca_dir, "ov-tls-g3c-us", "Example OV TLS Issuing CA G3C")
+    _write_ca_pair(ca_dir, "ev-tls-g3b-nl", "Example EV TLS Issuing CA G3B")
+    cfg = load_config(_directory_config(tmp_path, ca_dir))
+    store = CertificateStore(cfg)
+    assert sorted(store.issuers) == ["ev-tls-g3b-nl", "ov-tls-g3c-us"]
+    assert store.endpoint_issuer["robot.example.test"] == "ov-tls-g3c-us"
+    cert_path, _, created = store.get_or_issue("robot.example.test")
+    assert created
+    issued = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    assert "Example OV TLS Issuing CA G3C" in issued.issuer.rfc4514_string()
+
+
+def test_directory_issuer_default_and_tls_handshake(tmp_path):
+    ca_dir = tmp_path / "cas"
+    ca_dir.mkdir()
+    _write_ca_pair(ca_dir, "ov-tls-g3c-us", "Example OV TLS Issuing CA G3C")
+    _write_ca_pair(ca_dir, "dv-tls-g3b-nl", "Example DV TLS Issuing CA G3B")
+    cfg = load_config(_directory_config(
+        tmp_path, ca_dir,
+        extra_certificates='default_issuer = "DV TLS"',
+        extra_endpoint='[[endpoints]]\nhostname = "other.example.test"\n'))
+    service = JITCAService(cfg)
+    service.start()
+    try:
+        response, _ = tls_request(service.tls_address[1], ca_dir / "ov-tls-g3c-us.pem")
+        assert b"200 OK" in response
+        other_cert_path, _, _ = service.store.get_or_issue("other.example.test")
+        other_cert = x509.load_pem_x509_certificate(other_cert_path.read_bytes())
+        assert "Example DV TLS Issuing CA G3B" in other_cert.issuer.rfc4514_string()
+    finally:
+        service.stop()
+
+
+def test_directory_issuer_ambiguous_selector_rejected(tmp_path):
+    from jitca.certs import CertificateStore
+
+    ca_dir = tmp_path / "cas"
+    ca_dir.mkdir()
+    _write_ca_pair(ca_dir, "ov-tls-g3c-us", "Example OV TLS Issuing CA G3C")
+    _write_ca_pair(ca_dir, "ov-tls-g3b-nl", "Example OV TLS Issuing CA G3B")
+    cfg = load_config(_directory_config(tmp_path, ca_dir))  # selector "OV TLS" matches both
+    with pytest.raises(ValueError, match="matched 2 CA"):
+        CertificateStore(cfg)
+
+
+def test_directory_issuer_orphan_key_rejected(tmp_path):
+    from jitca.certs import CertificateStore
+
+    ca_dir = tmp_path / "cas"
+    ca_dir.mkdir()
+    _write_ca_pair(ca_dir, "ov-tls-g3c-us", "Example OV TLS Issuing CA G3C")
+    (ca_dir / "stray.key").write_bytes((ca_dir / "ov-tls-g3c-us.key").read_bytes())
+    cfg = load_config(_directory_config(tmp_path, ca_dir))
+    with pytest.raises(ValueError, match="without matching certificate"):
+        CertificateStore(cfg)
+
+
+def test_config_rejects_issuer_selector_outside_directory_mode(tmp_path):
+    path = config_file(tmp_path)
+    path.write_text(path.read_text().replace(
+        '[[endpoints]]\nhostname = "robot.example.test"',
+        '[[endpoints]]\nhostname = "robot.example.test"\nissuer = "anything"'))
+    with pytest.raises(ValueError, match="certificates.mode"):
+        load_config(path)
+
+
+def test_config_directory_mode_requires_a_selector(tmp_path):
+    ca_dir = tmp_path / "cas"
+    ca_dir.mkdir()
+    path = tmp_path / "config.toml"
+    path.write_text(f'''
+[network]
+dns_host = "127.0.0.1"
+dns_port = 0
+tls_host = "127.0.0.1"
+tls_port = 0
+redirect_ipv4 = "127.0.0.1"
+allowed_clients = ["127.0.0.1/32"]
+[certificates]
+mode = "directory"
+ca_dir = "{ca_dir}"
+state_dir = "state"
+leaf_days = 30
+leaf_key = "rsa2048"
+[[endpoints]]
+hostname = "robot.example.test"
+[[endpoints.routes]]
+method = "GET"
+path = "/status"
+body = '{{"connected":true}}'
+''')
+    with pytest.raises(ValueError, match="no issuer selector"):
+        load_config(path)
+
+
 def test_external_intermediate_chain(tmp_path):
     """Exercise the optional signer with a synthetic cross-signed-style CA chain."""
     from datetime import datetime, timedelta, timezone

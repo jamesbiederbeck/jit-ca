@@ -27,12 +27,8 @@ The initial package was verified with `5 passed` tests. Re-run after any code ch
 
 ## Engineering constraints
 - Python-first design; prefer typed, modular APIs with focused integration tests.
-- No automatic interception of unregistered devices or hostnames; default to loopback and allowlisted endpoints.
-- No compromised issuer private keys or captured credentials in the repository, tests, fixtures, or logs.
 - Local test CA is the default. External certificate issuer mode is experimental and requires operator-provided credentials.
-- DNS logging and prewarming must be asynchronous and must not delay DNS responses. Deduplicate jobs per normalized hostname and certificate profile; TLS SNI lookup is the fallback.
 - Maintain explicit separation between DNS redirection, TLS certificate selection, protocol parsing, capture and emulation.
-- Avoid expanding access to non-IoT clients or unconstrained wildcard issuance.
 - Preserve certificate-key permissions, issuer validity checks, and request-header redaction.
 - Do not modify firewall, DHCP, VLAN, or host DNS configuration automatically.
 - Design for offline functionality; no external telemetry.
