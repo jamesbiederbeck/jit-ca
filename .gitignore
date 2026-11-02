@@ -3,3 +3,5 @@ state/
 __pycache__/
 .pytest_cache/
 .venv/
+config.toml
+issuer/

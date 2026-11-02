@@ -106,6 +106,10 @@ issuer = "EV TLS"           # per-endpoint override of default_issuer
 
 Each `.pem` must have a sibling `.key` of the same filename stem (and vice versa); any orphan file is a configuration error. Filenames are for human reference only — JIT CA reads each CA's **profile from the certificate itself** (subject DN, CA basic constraints, `keyCertSign`) rather than trusting the filename. `default_issuer` and any per-endpoint `issuer` selector must each match **exactly one** CA's subject in the directory; zero or multiple matches is a startup error. Per-endpoint `issuer` is only valid when `certificates.mode = "directory"`. As with the external profile, this does not bypass pinning, mTLS, revocation, or expiry, and is not automatically eMudhra- or vendor-aware.
 
+#### Autodiscovering issuer pairs
+
+`scripts/discover-issuers.sh <source_dir> [config.toml] [ca_dir]` scans a pool of candidate `<stem>.pem`/`<stem>.key` pairs, keeps only the ones OpenSSL's `-purpose` check reports as `SSL server CA : Yes`, copies the matching pairs into the configured `ca_dir` (mode `0600`), and edits `config.toml` in place to set `mode = "directory"`, `ca_dir`, and (when exactly one issuer is found) `default_issuer` to that CA's common name. It never trusts filenames, requires both `ripgrep` and `openssl` on `PATH`, and leaves `default_issuer`/per-endpoint `issuer` for you to set by hand when more than one issuer is discovered.
+
 ## Actual IoT/VLAN testing
 
 The demo binds to loopback and uses high, unprivileged ports. To test with an enrolled device, you must separately configure an isolated device VLAN, firewall rules, DNS forwarding/overrides, correct advertised gateway IP, and port routing for actual 53/443. These changes are **not** made by this POC. Be aware that if the real endpoint uses a non-HTTP/1.1 protocol, different port, pinned server key, or client certificates, the device won't be supported yet.
