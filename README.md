@@ -8,6 +8,14 @@ Requires Python **3.11+** and `cryptography`. All code is Python; there are no s
 
 ## Run locally
 
+The upstream [emudrahahahahaha](https://github.com/Fluepke/emudrahahahahaha) repository is pinned as a Git submodule at `third_party/emudrahahahahaha`, with `main` configured as its update branch. Initialize it after cloning:
+
+```bash
+git submodule update --init third_party/emudrahahahahaha
+```
+
+The submodule is available for integration work; JIT CA does not load or execute it automatically.
+
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
