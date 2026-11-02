@@ -1,0 +1,4 @@
+[submodule "third_party/emudrahahahahaha"]
+	path = third_party/emudrahahahahaha
+	url = https://github.com/Fluepke/emudrahahahahaha.git
+	branch = main

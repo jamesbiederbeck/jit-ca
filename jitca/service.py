@@ -3,15 +3,16 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
-import os
 from pathlib import Path
 import queue
+import socket
 import socketserver
 import ssl
 import struct
 import threading
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
+from http.client import HTTPException
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -20,24 +21,8 @@ from cryptography.x509.oid import NameOID
 
 from .certs import CertificateStore, _save_private, _private_pem
 from .config import Config, canonical_hostname
-
-
-class EventLog:
-    def __init__(self, path: Path):
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.path = path
-        self._lock = threading.Lock()
-        descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-        self._stream = os.fdopen(descriptor, "a", buffering=1)
-
-    def emit(self, event: str, **details) -> None:
-        with self._lock:
-            self._stream.write(json.dumps({"time": datetime.now(timezone.utc).isoformat(),
-                                           "event": event, **details}, default=str) + "\n")
-
-    def close(self):
-        with self._lock:
-            self._stream.close()
+from .events import EventLog
+from .http import Response, encode_response, respond, select_route
 
 
 class CertificatePrewarmer:
@@ -47,13 +32,24 @@ class CertificatePrewarmer:
         self.queue: queue.Queue[str | None] = queue.Queue()
         self.pending: set[str] = set()
         self.lock = threading.Lock()
+        self._started = False
+        self._stopped = False
         self.thread = threading.Thread(target=self._work, name="jitca-cert-prewarm", daemon=True)
 
     def start(self):
-        self.thread.start()
+        with self.lock:
+            if self._started or self._stopped:
+                raise RuntimeError("certificate worker cannot be restarted")
+            self.thread.start()
+            self._started = True
 
     def request(self, hostname: str):
+        hostname = canonical_hostname(hostname)
+        if hostname not in self.store.config.endpoints:
+            raise PermissionError(f"hostname not approved: {hostname}")
         with self.lock:
+            if not self._started or self._stopped:
+                raise RuntimeError("certificate worker is not running")
             if hostname not in self.pending:
                 self.pending.add(hostname)
                 self.queue.put(hostname)
@@ -76,8 +72,13 @@ class CertificatePrewarmer:
                 self.queue.task_done()
 
     def stop(self):
-        self.queue.put(None)
-        self.thread.join(timeout=5)
+        with self.lock:
+            if not self._stopped:
+                self._stopped = True
+                if self._started:
+                    self.queue.put(None)
+        if self._started:
+            self.thread.join()
 
 
 def _parse_dns_question(payload: bytes):
@@ -122,14 +123,22 @@ def _parse_dns_question(payload: bytes):
     return ident, flags, hostname, qtype, qclass, payload[12:question_end+4]
 
 
-def _dns_response(payload: bytes, config: Config):
+def _dns_response(payload: bytes, config: Config, client_ip: str = "127.0.0.1"):
     ident, flags, hostname, qtype, qclass, question = _parse_dns_question(payload)
     approved = hostname in config.endpoints
     rcode = 0 if approved else 5  # REFUSED for unknown hostnames (no forwarding in POC).
     answer = b""
     if approved and qtype == 1 and qclass == 1:
         answer = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 30, 4)
-        answer += ipaddress.IPv4Address(config.redirect_ipv4).packed
+        redirect = config.redirect_ipv4
+        if redirect is None:
+            redirect = socket.gethostbyname(config.tls_host)
+            if ipaddress.IPv4Address(redirect).is_unspecified:
+                # Route lookup only: UDP connect sends no packet.
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                    probe.connect((client_ip, 9))
+                    redirect = probe.getsockname()[0]
+        answer += ipaddress.IPv4Address(redirect).packed
     reply_flags = 0x8000 | 0x0400 | (flags & 0x0100) | rcode
     header = struct.pack("!HHHHHH", ident, reply_flags, 1, int(bool(answer)), 0, 0)
     return header + question + answer, hostname, approved, qtype
@@ -143,8 +152,8 @@ class _DNSHandler(socketserver.BaseRequestHandler):
             controller.log.emit("dns_denied", source=self.client_address[0])
             return
         try:
-            response, hostname, approved, qtype = _dns_response(data, controller.config)
-        except (ValueError, UnicodeDecodeError) as exc:
+            response, hostname, approved, qtype = _dns_response(data, controller.config, self.client_address[0])
+        except (ValueError, UnicodeDecodeError, OSError) as exc:
             controller.log.emit("dns_invalid", source=self.client_address[0], error=str(exc))
             return
         controller.log.emit("dns_query", source=self.client_address[0], hostname=hostname,
@@ -156,7 +165,7 @@ class _DNSHandler(socketserver.BaseRequestHandler):
 
 class _DNSServer(socketserver.ThreadingUDPServer):
     allow_reuse_address = True
-    daemon_threads = True
+    daemon_threads = False  # server_close waits for handlers before their dependencies close.
 
     def __init__(self, address, controller):
         super().__init__(address, _DNSHandler)
@@ -183,20 +192,22 @@ def _bootstrap_context(path: Path) -> ssl.SSLContext:
     return context
 
 
+def _redact(value):
+    if isinstance(value, dict):
+        return {k: "[REDACTED]" if any(p in k.lower() for p in (
+            "pass", "secret", "token", "auth", "cookie", "credential", "apikey", "api_key"))
+            else _redact(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact(v) for v in value[:50]]
+    return value
+
+
 def _safe_preview(body: bytes):
     if not body:
         return ""
     try:
         payload = json.loads(body)
-        def redact(value):
-            if isinstance(value, dict):
-                return {k: "[REDACTED]" if any(p in k.lower() for p in (
-                    "pass", "secret", "token", "auth", "cookie", "credential", "apikey", "api_key"))
-                    else redact(v) for k, v in value.items()}
-            if isinstance(value, list):
-                return [redact(v) for v in value[:50]]
-            return value
-        return json.dumps(redact(payload), ensure_ascii=False)[:4096]
+        return json.dumps(_redact(payload), ensure_ascii=False)[:4096]
     except (ValueError, UnicodeDecodeError):
         return "[non-JSON body omitted]"
 
@@ -209,6 +220,8 @@ def _read_http(stream, max_body):
     if len(parts) != 3 or not parts[2].startswith("HTTP/1."):
         raise ValueError("unsupported HTTP request")
     method, target, version = parts
+    if not target.startswith("/") or target.startswith("//") or "#" in target:
+        raise ValueError("request target must be an origin-form path")
     headers, total = {}, 0
     for _ in range(100):
         line = stream.readline(8193)
@@ -256,38 +269,39 @@ class _TLSHandler(socketserver.BaseRequestHandler):
             return
         self.request.settimeout(8)
         wrapped = None
+        stream = None
         try:
-            wrapped = ctrl.base_ssl.wrap_socket(self.request, server_side=True, do_handshake_on_connect=True)
-            with ctrl.selected_lock:
-                hostname = ctrl.selected.pop(wrapped.fileno(), None)
+            wrapped = ctrl.base_ssl.wrap_socket(self.request, server_side=True, do_handshake_on_connect=False)
+            wrapped.do_handshake()
+            hostname = getattr(wrapped, "_jitca_hostname", None)
             if hostname is None:
                 raise ValueError("no selected hostname")
             stream = wrapped.makefile("rb")
             method, target, version, headers, request_body = _read_http(stream, ctrl.config.max_body_bytes)
+            parsed = urlsplit(target)
+            parameters = _redact(parse_qs(parsed.query, keep_blank_values=True, max_num_fields=1000))
+            public_headers = _redact(headers)
+            request_details = dict(source=client_ip, hostname=hostname, method=method,
+                                   path=parsed.path, query_parameters=parameters,
+                                   request_headers=public_headers, request_bytes=len(request_body),
+                                   request_sha256=hashlib.sha256(request_body).hexdigest(),
+                                   request_preview=_safe_preview(request_body))
+            ctrl.log.emit("http_request", **request_details)
             host_header = headers.get("host", "")
             # Host and SNI must match; no cross-vhost routing.
-            if host_header.split(":")[0].lower() != hostname:
-                status, body, typ = 403, b'{"error":"Host/SNI mismatch"}', "application/json"
+            if canonical_hostname(host_header.split(":")[0]) != hostname:
+                result = Response(403, b'{"error":"Host/SNI mismatch"}', {"content-type": "application/json"})
             else:
-                route_path = urlsplit(target).path
-                route = next((x for x in ctrl.config.endpoints[hostname].routes
-                              if x.method == method and x.path == route_path), None)
-                if route is None:
-                    status, body, typ = 404, b'{"error":"unimplemented endpoint"}', "application/json"
-                else:
-                    status, body, typ = route.status, route.body.encode("utf-8"), route.content_type
-            response = _http_response(status, body, typ)
-            wrapped.sendall(response)
-            public_headers = {k: ("[REDACTED]" if k in (
-                "authorization", "cookie", "proxy-authorization", "x-api-key", "x-auth-token") else v)
-                for k, v in headers.items()}
-            ctrl.log.emit("http_flow", source=client_ip, hostname=hostname,
-                          method=method, path=urlsplit(target).path, status=status,
+                route = select_route(ctrl.config.endpoints[hostname], method, parsed.path)
+                try:
+                    result = respond(ctrl.config, route, method, target, headers, request_body)
+                except (HTTPException, OSError, ValueError) as exc:
+                    ctrl.log.emit("backend_error", hostname=hostname, path=parsed.path, error=str(exc))
+                    result = Response(502, b'{"error":"backend unavailable"}', {"content-type": "application/json"})
+            wrapped.sendall(encode_response(result, method))
+            ctrl.log.emit("http_flow", **request_details, status=result.status,
                           tls_version=wrapped.version(), cipher=wrapped.cipher()[0],
-                          request_headers=public_headers, request_bytes=len(request_body),
-                          request_sha256=hashlib.sha256(request_body).hexdigest(),
-                          request_preview=_safe_preview(request_body),
-                          response_preview=_safe_preview(body))
+                          response_preview=_safe_preview(result.body))
         except (ssl.SSLError, OSError, ValueError, UnicodeError) as exc:
             ctrl.log.emit("tls_or_http_error", source=client_ip, error=str(exc))
             if wrapped is not None:
@@ -296,15 +310,15 @@ class _TLSHandler(socketserver.BaseRequestHandler):
                 except OSError:
                     pass
         finally:
+            if stream is not None:
+                stream.close()
             if wrapped is not None:
                 wrapped.close()
-            with ctrl.selected_lock:
-                ctrl.selected.pop(self.request.fileno(), None)
 
 
 class _TLSServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
-    daemon_threads = True
+    daemon_threads = False
 
     def __init__(self, address, controller):
         super().__init__(address, _TLSHandler)
@@ -316,15 +330,25 @@ class JITCAService:
         self.config = config
         config.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.log = EventLog(config.state_dir / "events.jsonl")
-        self.store = CertificateStore(config)
-        self.prewarmer = CertificatePrewarmer(self.store, self.log)
-        self.selected: dict[int, str] = {}
-        self.selected_lock = threading.Lock()
-        self.base_ssl = _bootstrap_context(config.state_dir / "certificates")
-        self.base_ssl.sni_callback = self._sni_callback
-        self.dns_server = _DNSServer((config.dns_host, config.dns_port), self)
-        self.tls_server = _TLSServer((config.tls_host, config.tls_port), self)
+        self._lifecycle_lock = threading.RLock()
+        self._state = "new"
+        self._servers = []
+        self._running_servers = []
         self.threads: list[threading.Thread] = []
+        try:
+            self.store = CertificateStore(config)
+            self.prewarmer = CertificatePrewarmer(self.store, self.log)
+            self.base_ssl = _bootstrap_context(config.state_dir / "certificates")
+            self.base_ssl.sni_callback = self._sni_callback
+            self.dns_server = _DNSServer((config.dns_host, config.dns_port), self)
+            self._servers.append(self.dns_server)
+            self.tls_server = _TLSServer((config.tls_host, config.tls_port), self)
+            self._servers.append(self.tls_server)
+        except BaseException:
+            for server in reversed(self._servers):
+                server.server_close()
+            self.log.close()
+            raise
 
     @property
     def dns_address(self):
@@ -348,27 +372,42 @@ class JITCAService:
         try:
             context, issued = self.store.ssl_context(hostname)
             ssl_obj.context = context
-            with self.selected_lock:
-                self.selected[ssl_obj.fileno()] = hostname
+            ssl_obj._jitca_hostname = hostname
             self.log.emit("tls_certificate_selected", hostname=hostname, new=issued)
         except Exception as exc:
             self.log.emit("tls_cert_error", hostname=hostname, error=str(exc))
             return ssl.ALERT_DESCRIPTION_INTERNAL_ERROR
 
     def start(self):
-        self.prewarmer.start()
-        for name, server in (("jitca-dns", self.dns_server), ("jitca-tls", self.tls_server)):
-            thread = threading.Thread(target=server.serve_forever, name=name, daemon=True)
-            thread.start()
-            self.threads.append(thread)
-        self.log.emit("service_started", dns_address=self.dns_address, tls_address=self.tls_address)
+        with self._lifecycle_lock:
+            if self._state != "new":
+                raise RuntimeError("service can only be started once")
+            self._state = "running"
+            try:
+                self.prewarmer.start()
+                for name, server in (("jitca-dns", self.dns_server), ("jitca-tls", self.tls_server)):
+                    thread = threading.Thread(target=server.serve_forever,
+                                              kwargs={"poll_interval": 0.1}, name=name, daemon=True)
+                    thread.start()
+                    self.threads.append(thread)
+                    self._running_servers.append(server)
+                self.log.emit("service_started", dns_address=self.dns_address, tls_address=self.tls_address)
+            except BaseException:
+                self.stop()
+                raise
 
     def stop(self):
-        for server in (self.dns_server, self.tls_server):
-            server.shutdown()
-            server.server_close()
-        self.prewarmer.stop()
-        for thread in self.threads:
-            thread.join(timeout=5)
-        self.log.emit("service_stopped")
-        self.log.close()
+        with self._lifecycle_lock:
+            if self._state == "stopped":
+                return
+            # Stop accepting first, then drain every producer before closing the log.
+            for server in self._running_servers:
+                server.shutdown()
+            for server in self._servers:
+                server.server_close()
+            self.prewarmer.stop()
+            for thread in self.threads:
+                thread.join()
+            self.log.emit("service_stopped")
+            self._state = "stopped"
+            self.log.close()

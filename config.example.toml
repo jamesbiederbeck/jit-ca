@@ -5,7 +5,9 @@ dns_host = "127.0.0.1"
 dns_port = 15353
 tls_host = "127.0.0.1"
 tls_port = 18443
-redirect_ipv4 = "127.0.0.1"
+# DNS A answers default to the service's TLS bind/interface address.
+# Override for NAT, containers, or a different externally reachable gateway:
+# redirect_ipv4 = "192.0.2.10"
 allowed_clients = ["127.0.0.1/32", "::1/128"]
 
 [certificates]
@@ -31,9 +33,13 @@ leaf_key = "rsa2048"             # or p256
 
 [http]
 max_body_bytes = 65536
+backend_timeout_seconds = 5
+max_response_bytes = 1048576
 
 [[endpoints]]
 hostname = "robot.example.test"
+# With no routes, every request is logged, answered with empty 204, and closed.
+# These optional fixtures demonstrate how to start building a local API.
 
 [[endpoints.routes]]
 method = "GET"
@@ -48,3 +54,10 @@ path = "/commands"
 status = 202
 content_type = "application/json"
 body = '{"accepted":true,"source":"jitca"}'
+
+# Optional backend directive, scoped to this hostname and a path prefix.
+# The backend can be your own Python app, nginx, Apache, or another emulator.
+# [[endpoints.routes]]
+# path_prefix = "/api/"
+# proxy_pass = "http://127.0.0.1:9000"
+# headers = { X-Emulator = "local" }

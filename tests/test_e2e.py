@@ -89,11 +89,11 @@ def test_dns_prewarm_tls_flow(tmp_path):
         assert b"HTTP/1.1 200 OK" in result
         assert b'"connected":true' in result
         assert tlsver in ("TLSv1.2", "TLSv1.3")
-        # Unknown path still terminates TLS and gets explicit unimplemented answer.
+        # Unknown paths are observed and receive an empty 204 response.
         res2, _ = tls_request(server.tls_address[1], server.store.root_ca_path, path="/missing")
-        assert b"404 Not Found" in res2
+        assert b"204 No Content" in res2
         res3, _ = tls_request(server.tls_address[1], server.store.root_ca_path,
-                              body=b'{"password":"abc","thing":1}', path="/command")
+                                  body=b'{"password":"secret-that-must-never-appear-in-capture","thing":1}', path="/command")
         assert b"202 Accepted" in res3
         # Repeated A/AAAA queries do not duplicate a certificate.
         for _ in range(4):
@@ -112,9 +112,9 @@ def test_dns_prewarm_tls_flow(tmp_path):
     assert any(x["event"] == "cert_prewarmed" and x["new"] for x in events)
     assert any(x["event"] == "tls_certificate_selected" and not x["new"] for x in events)
     flows = [x for x in events if x["event"] == "http_flow"]
-    assert [x["status"] for x in flows] == [200,404,202]
+    assert [x["status"] for x in flows] == [200,204,202]
     assert '"password": "[REDACTED]"' in flows[-1]["request_preview"]
-    assert "abc" not in (config.state_dir / "events.jsonl").read_text()
+    assert "secret-that-must-never-appear-in-capture" not in (config.state_dir / "events.jsonl").read_text()
     assert (config.state_dir / "events.jsonl").stat().st_mode & 0o077 == 0
     assert list((config.state_dir / "certificates").glob("*/fullchain.pem"))
 
