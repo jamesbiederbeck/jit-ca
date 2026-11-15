@@ -167,7 +167,13 @@ Each `.pem` must have a sibling `.key` of the same filename stem (and vice versa
 
 #### Autodiscovering issuer pairs
 
-`scripts/discover-issuers.sh <source_dir> [config.toml] [ca_dir]` scans a pool of candidate `<stem>.pem`/`<stem>.key` pairs, keeps only the ones OpenSSL's `-purpose` check reports as `SSL server CA : Yes`, copies the matching pairs into the configured `ca_dir` (mode `0600`), and edits `config.toml` in place to set `mode = "directory"`, `ca_dir`, and (when exactly one issuer is found) `default_issuer` to that CA's common name. It never trusts filenames, requires both `ripgrep` and `openssl` on `PATH`, and leaves `default_issuer`/per-endpoint `issuer` for you to set by hand when more than one issuer is discovered.
+`scripts/discover-issuers.sh <source_dir> [config.toml] [ca_dir]` scans a pool of candidate `<stem>.pem`/`<stem>.key` pairs, keeps only the ones OpenSSL's `-purpose` check reports as `SSL server CA : Yes`, copies the matching pairs into the configured `ca_dir` (mode `0600`), and edits the `[certificates]` table of `config.toml` in place to set `mode = "directory"`, `ca_dir`, and (when exactly one issuer is found) `default_issuer` to that CA's common name. It never trusts filenames, requires both `ripgrep` and `openssl` on `PATH`, and leaves `default_issuer`/per-endpoint `issuer` for you to set by hand when more than one issuer is discovered.
+
+The `third_party/emudrahahahahaha` submodule (see [Run locally](#run-locally)) is shaped exactly like this: a flat pool of `<stem>.pem`/`<stem>.key` CA pairs with no manifest. After `git submodule update --init third_party/emudrahahahahaha`, point the script at it directly:
+
+```bash
+scripts/discover-issuers.sh third_party/emudrahahahahaha config.toml
+```
 
 ## Actual IoT/VLAN testing
 
