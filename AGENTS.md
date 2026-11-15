@@ -3,7 +3,7 @@
 ## Purpose
 JIT CA is a self-hosted development workbench for recovering cloud-dependent IoT devices **owned by the operator**. It provides DNS-triggered certificate prewarming, on-demand TLS termination, request observation, and synthetic responses. The long-term goal is a reusable framework for developing standalone local emulators of discontinued vendor cloud services (a Roomba cloud replacement is an example of the class of project, not an already implemented adapter).
 
-Start by reading `README.md` and `CODEX_HANDOFF.md`. Treat them as the current implementation summary and target roadmap respectively. Do not infer implementation from the roadmap.
+Start by reading `README.md`, `ROADMAP.md`, and `CODEX_HANDOFF.md`. Treat `README.md` as the current implementation summary, `ROADMAP.md` as the capability status snapshot, and `CODEX_HANDOFF.md` as the target roadmap. Do not infer implementation from the roadmap.
 
 ## Existing code
 - `jitca/certs.py`: issuer setup, PEM validation, signed leaf generation, persistent cache.
@@ -39,7 +39,8 @@ The initial package was verified with `5 passed` tests. Re-run after any code ch
 1. Inspect implementation and tests before changing code.
 2. Summarize the specific next vertical slice and its acceptance criteria.
 3. Implement it with tests and update `README.md` for changed behavior.
-4. Run `pytest -q`, and report results and any untested assumptions.
-5. Do not claim physical-device or eMudhra compatibility without explicit tests.
+4. When a feature lands (moves from "Missing" to "Implemented", or its status otherwise changes), update `ROADMAP.md` in the same change set.
+5. Run `pytest -q`, and report results and any untested assumptions.
+6. Do not claim physical-device or eMudhra compatibility without explicit tests.
 
 See `CODEX_HANDOFF.md` for prioritized follow-up work.
