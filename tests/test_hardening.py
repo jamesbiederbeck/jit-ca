@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import threading
+import time
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -84,34 +85,37 @@ def test_issuer_limited_leaf_reused(tmp_path):
     assert not store.get_or_issue("robot.example.test")[2]
 
 
-def test_dns_response_during_signing_and_concurrent_tls(tmp_path, monkeypatch):
+def test_dns_blocks_until_certificate_ready(tmp_path, monkeypatch):
     service = JITCAService(load_config(config_file(tmp_path)))
-    signing = threading.Event()
     release = threading.Event()
     generate = certs.rsa.generate_private_key
     calls = []
 
     def delayed_key(*args, **kwargs):
         calls.append(1)
-        signing.set()
         assert release.wait(5), "test did not release certificate signer"
         return generate(*args, **kwargs)
 
     monkeypatch.setattr(certs.rsa, "generate_private_key", delayed_key)
     service.start()
     try:
-        # DNS must return while the certificate signer is blocked.
-        lookup(service.dns_address[1], "robot.example.test")
-        assert signing.wait(2)
-        lookup(service.dns_address[1], "robot.example.test", qtype=28)
         with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(tls_request, service.tls_address[1], service.store.root_ca_path)
+            future = pool.submit(lookup, service.dns_address[1], "robot.example.test")
+            time.sleep(0.2)
+            # The DNS reply is withheld while the leaf certificate is still being signed.
+            assert not future.done()
             release.set()
-            response, _ = future.result(timeout=5)
-        assert b"200 OK" in response
-        service.prewarmer.queue.join()
+            future.result(timeout=5)
         assert len(calls) == 1
         assert len(service.store.all_metadata()) == 1
+        # The certificate is already issued by the time DNS answers, so TLS never
+        # has to sign on a cache miss.
+        response, _ = tls_request(service.tls_address[1], service.store.root_ca_path)
+        assert b"200 OK" in response
+        assert len(calls) == 1
+        # AAAA queries still only queue prewarming and do not block on signing.
+        lookup(service.dns_address[1], "robot.example.test", qtype=28)
+        service.prewarmer.queue.join()
     finally:
         release.set()
         service.stop()

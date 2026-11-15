@@ -25,6 +25,15 @@ from .events import EventLog
 from .http import Response, encode_response, respond, select_route
 
 
+def _issue_and_log(store: CertificateStore, log: EventLog, hostname: str) -> None:
+    try:
+        cert_path, _, issued = store.get_or_issue(hostname)
+        log.emit("cert_prewarmed", hostname=hostname, new=issued,
+                 certificate=str(cert_path.relative_to(store.config.state_dir)))
+    except Exception as exc:
+        log.emit("cert_prewarm_error", hostname=hostname, error=str(exc))
+
+
 class CertificatePrewarmer:
     def __init__(self, store: CertificateStore, log: EventLog):
         self.store = store
@@ -61,11 +70,7 @@ class CertificatePrewarmer:
                 self.queue.task_done()
                 return
             try:
-                cert_path, _, issued = self.store.get_or_issue(hostname)
-                self.log.emit("cert_prewarmed", hostname=hostname, new=issued,
-                              certificate=str(cert_path.relative_to(self.store.config.state_dir)))
-            except Exception as exc:
-                self.log.emit("cert_prewarm_error", hostname=hostname, error=str(exc))
+                _issue_and_log(self.store, self.log, hostname)
             finally:
                 with self.lock:
                     self.pending.discard(hostname)
@@ -141,7 +146,7 @@ def _dns_response(payload: bytes, config: Config, client_ip: str = "127.0.0.1"):
         answer += ipaddress.IPv4Address(redirect).packed
     reply_flags = 0x8000 | 0x0400 | (flags & 0x0100) | rcode
     header = struct.pack("!HHHHHH", ident, reply_flags, 1, int(bool(answer)), 0, 0)
-    return header + question + answer, hostname, approved, qtype
+    return header + question + answer, hostname, approved, qtype, bool(answer)
 
 
 class _DNSHandler(socketserver.BaseRequestHandler):
@@ -152,14 +157,20 @@ class _DNSHandler(socketserver.BaseRequestHandler):
             controller.log.emit("dns_denied", source=self.client_address[0])
             return
         try:
-            response, hostname, approved, qtype = _dns_response(data, controller.config, self.client_address[0])
+            response, hostname, approved, qtype, answered = _dns_response(
+                data, controller.config, self.client_address[0])
         except (ValueError, UnicodeDecodeError, OSError) as exc:
             controller.log.emit("dns_invalid", source=self.client_address[0], error=str(exc))
             return
         controller.log.emit("dns_query", source=self.client_address[0], hostname=hostname,
                             qtype=qtype, intercepted=approved)
         if approved:
-            controller.prewarmer.request(hostname)
+            if answered:
+                # Hold the reply until the leaf certificate is actually ready, so the
+                # client's TLS handshake never hits a signing cache-miss.
+                _issue_and_log(controller.store, controller.log, hostname)
+            else:
+                controller.prewarmer.request(hostname)
         sock.sendto(response, self.client_address)
 
 
@@ -170,6 +181,14 @@ class _DNSServer(socketserver.ThreadingUDPServer):
     def __init__(self, address, controller):
         super().__init__(address, _DNSHandler)
         self.controller = controller
+
+    def server_close(self):
+        # A handler may still be blocked signing a certificate and will send its
+        # reply on this same shared UDP socket; join it before the socket closes
+        # instead of ThreadingMixIn's default close-then-join order, which would
+        # otherwise race an in-flight reply against socket teardown.
+        self._threads.join()
+        super().server_close()
 
 
 def _bootstrap_context(path: Path) -> ssl.SSLContext:

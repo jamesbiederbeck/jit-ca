@@ -57,27 +57,29 @@ def test_slow_log_does_not_delay_dns_or_tls_and_shutdown_flushes(tmp_path, monke
 
 
 def test_shutdown_drains_inflight_signing(tmp_path, monkeypatch):
+    # DNS now blocks the reply on signing, so the in-flight work to drain during
+    # shutdown lives in the DNS handler thread, not the prewarmer queue.
     service = JITCAService(load_config(config_file(tmp_path)))
     signing, draining, release = (threading.Event() for _ in range(3))
     issue = service.store.get_or_issue
-    stop = service.prewarmer.stop
+    close = service.dns_server.server_close
 
     def slow_issue(hostname):
         signing.set()
         assert release.wait(5)
         return issue(hostname)
 
-    def drain_worker():
+    def drain_handler():
         draining.set()
-        stop()
+        close()
 
     monkeypatch.setattr(service.store, "get_or_issue", slow_issue)
-    monkeypatch.setattr(service.prewarmer, "stop", drain_worker)
+    monkeypatch.setattr(service.dns_server, "server_close", drain_handler)
     service.start()
     try:
-        lookup(service.dns_address[1], "robot.example.test")
-        assert signing.wait(2)
-        with ThreadPoolExecutor(max_workers=1) as pool:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            query = pool.submit(lookup, service.dns_address[1], "robot.example.test")
+            assert signing.wait(2)
             stopping = pool.submit(service.stop)
             try:
                 assert draining.wait(2)
@@ -86,6 +88,7 @@ def test_shutdown_drains_inflight_signing(tmp_path, monkeypatch):
             finally:
                 release.set()
             stopping.result(timeout=5)
+            query.result(timeout=5)
     finally:
         release.set()
         service.stop()
