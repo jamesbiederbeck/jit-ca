@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Export captured http_request events as a portable shell script of curl commands.
 
-Never executes curl. Preserves original credentials and payload bytes.
+Never executes curl. Preserves original values unless anonymization is requested.
 """
 from __future__ import annotations
 
@@ -17,6 +17,8 @@ import sys
 from urllib.parse import urlencode
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from curl_anonymize import Anonymizer
 HOP_HEADERS = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
                'te', 'trailer', 'transfer-encoding', 'upgrade', 'proxy-connection'}
 
@@ -82,8 +84,38 @@ def export(args: argparse.Namespace) -> tuple[str, int, int]:
     captures = args.captures or args.events.parent / 'captures'
     prepared = []
     skipped = []
+    transformed = bool(args.anonymize or args.anonymize_credentials or args.anonymize_field or args.shift_time_seconds)
+    sanitizer = Anonymizer(args.anonymize, args.anonymize_credentials, args.shift_time_seconds,
+                           args.anonymize_seed, args.anonymize_field)
+    # Collect identifiers across selected requests before rewriting embedded strings.
+    if transformed:
+        for candidate in events:
+            sanitizer.collect({k: v for k, v in candidate.items()
+                               if k not in ('request_preview', 'request_capture')})
+
     for index, event in enumerate(events, 1):
         try:
+            payload = body_bytes(event, captures)
+            event = dict(event, request_headers={k.lower(): v for k, v in event.get('request_headers', {}).items()})
+            original_aws = event.get('request_headers', {}).get('authorization', '').startswith('AWS4-HMAC-SHA256')
+            if transformed:
+                if payload is not None:
+                    payload = sanitizer.payload(payload)
+                event = sanitizer.event(event, payload)
+            headers = dict(event.get('request_headers', {}))
+            resign = args.aws_resign and original_aws
+            aws_invalid = original_aws and transformed
+            if resign or aws_invalid:
+                headers.pop('authorization', None)
+                headers.pop('x-amz-date', None)
+                headers.pop('x-amz-security-token', None)
+                if payload is not None:
+                    headers['x-amz-content-sha256'] = hashlib.sha256(payload).hexdigest()
+                if not resign:
+                    headers['authorization'] = 'AWS4-HMAC-SHA256 REPLACE_WITH_NEW_SIGNATURE'
+                # Do not retain the original key ID/signature in manifest metadata.
+                event['request_headers'] = headers
+                event['aws_authentication'] = 'resign from environment' if resign else 'fresh signature required'
             host = event.get('hostname')
             if not isinstance(host, str) or not re.fullmatch(r'[A-Za-z0-9.-]+', host):
                 raise ValueError('missing or invalid DNS hostname')
@@ -99,7 +131,6 @@ def export(args: argparse.Namespace) -> tuple[str, int, int]:
             query = event.get('query_parameters', {})
             if query:
                 target += '?' + urlencode(query, doseq=True)
-            headers = event.get('request_headers', {})
             skip = HOP_HEADERS | {'host', 'content-length', 'expect', 'accept-encoding'}
             skip |= {name.strip().lower() for name in headers.get('connection', '').split(',')}
             header_lines = []
@@ -110,18 +141,19 @@ def export(args: argparse.Namespace) -> tuple[str, int, int]:
                         or not isinstance(value, str) or any(c in value for c in '\r\n')):
                     raise ValueError('invalid header')
                 header_lines.append(f'{name}: {value}\n')
-            payload = body_bytes(event, captures)
-            prepared.append((index, event, host, method, scheme, target, ''.join(header_lines), payload))
+            prepared.append((index, event, host, method, scheme, target, ''.join(header_lines), payload, resign))
         except (OSError, ValueError, KeyError, TypeError) as exc:
-            skipped.append({'event_index': index, 'host': event.get('hostname'), 'reason': str(exc)})
+            skipped.append({'event_index': index, 'host': event.get('hostname'), 'reason': 'capture unavailable or unsupported for anonymization' if transformed else str(exc)})
     args.output_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
     for name in ('headers', 'bodies'):
         (args.output_dir / name).mkdir(mode=0o700)
     script = ['#!/usr/bin/env bash', 'set -euo pipefail', 'umask 077',
               'cd "$(dirname "${BASH_SOURCE[0]}")"', 'mkdir -p responses',
               '# Export only: running this file sends the recorded requests.',
-              '# Query strings are reconstructed; expired AWS signatures are not refreshed.', '']
-    for index, event, host, method, scheme, target, header_text, payload in prepared:
+              '# Query strings are reconstructed; use --aws-resign when exporting to refresh AWS signatures.',
+              'aws_session=()',
+              '[[ -z ${AWS_SESSION_TOKEN:-} ]] || aws_session=(--header "X-Amz-Security-Token: $AWS_SESSION_TOKEN")', '']
+    for index, event, host, method, scheme, target, header_text, payload, resign in prepared:
         tag = f'{index:06d}'
         header_file = f'headers/{tag}.headers'
         private_write(args.output_dir / header_file, header_text.encode())
@@ -151,11 +183,22 @@ def export(args: argparse.Namespace) -> tuple[str, int, int]:
                 private_write(args.output_dir / filename, payload)
             command += ['--data-binary', '@' + filename]
         url = f'{scheme}://{host}' + (f':{port}' if port is not None else '') + target
-        command.append(url)
-        script += [f'# {tag}: {method} {host} ({event.get("time", "time unknown")})', shlex.join(command), '']
+        rendered = shlex.join(command)
+        if resign:
+            match = re.fullmatch(r'(kinesis|firehose)\.([a-z0-9-]+)\.amazonaws\.com', host)
+            if match is None:
+                raise ValueError('--aws-resign only supports captured Kinesis/Firehose hosts')
+            service, region = match.groups()
+            rendered += ' --aws-sigv4 ' + shlex.quote(f'aws:amz:{region}:{service}')
+            rendered += ' --user "${AWS_ACCESS_KEY_ID:?Set AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY:?Set AWS_SECRET_ACCESS_KEY}"'
+            rendered += ' "${aws_session[@]}"'
+        rendered += ' ' + shlex.quote(url)
+        script += [f'# {tag}: {method} {host} ({event.get("time", "time unknown")})', rendered, '']
     text = '\n'.join(script) + '\n'
     private_write(args.output_dir / 'commands.sh', text.encode(), 0o700)
     manifest = {'target': args.target, 'selected': len(events), 'exported': len(prepared),
+                'anonymization': {'identifiers': args.anonymize, 'credential_placeholders': args.anonymize_credentials,
+                                  'time_shift_seconds': args.shift_time_seconds, 'extra_fields': args.anonymize_field},
                 'skipped': skipped, 'requests': [{'index': row[0], 'event': row[1]} for row in prepared]}
     private_write(args.output_dir / 'manifest.json', (json.dumps(manifest, indent=2) + '\n').encode())
     return text, len(prepared), len(skipped)
@@ -179,6 +222,12 @@ def main() -> int:
                         str(ROOT / 'local_deployment/aaa-certificate-services.crt'))))
     parser.add_argument('--connect-timeout', type=float, default=5)
     parser.add_argument('--timeout', type=float, default=30)
+    parser.add_argument('--anonymize', action='store_true', help='replace device, advertising, session and serial IDs consistently')
+    parser.add_argument('--anonymize-credentials', action='store_true', help='replace auth, cookie, token and Sentry DSN keys with placeholders')
+    parser.add_argument('--anonymize-field', action='append', default=[], metavar='NAME', help='additional field/header/query name to pseudonymize')
+    parser.add_argument('--anonymize-seed', default=os.environ.get('JITCA_ANONYMIZE_SEED'), help='stable replacements across exports; default is random per export')
+    parser.add_argument('--shift-time-seconds', type=int, default=0, help='shift absolute timestamps, preserving durations; 0 leaves times unchanged')
+    parser.add_argument('--aws-resign', action='store_true', help='generate AWS signing from AWS_ACCESS_KEY_ID/SECRET_ACCESS_KEY at execution time')
     parser.add_argument('--quiet', action='store_true', help='save commands.sh without also printing it')
     args = parser.parse_args()
     if args.limit is not None and args.limit < 1:

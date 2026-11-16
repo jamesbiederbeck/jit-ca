@@ -397,7 +397,7 @@ python ../scripts/export-curl.py \
 Each command includes the original method, application headers, reconstructed
 query string and byte-for-byte captured body. Credentials are retained in private
 header files; query credentials remain in the generated URLs. No anonymization
-or redaction is performed. `--latest` keeps the last request per host, method,
+or redaction is performed unless the options below are selected. `--latest` keeps the last request per host, method,
 path and query-value combination, so home and WatchFree feature-flag queries
 remain distinct. Repeat `--hostname` for multiple hosts; `--method` and `--limit`
 provide additional filters. Non-request events are ignored to avoid counting
@@ -435,3 +435,52 @@ transport framing and response compression may differ. Recorded AWS signatures
 are preserved, not refreshed; expired signatures and signatures affected by
 query reconstruction may fail. Review captured credentials for expiration.
 Generated exports contain credentials and identifiers and must not be committed.
+
+### Anonymize exported requests
+
+```bash
+python ../scripts/export-curl.py \
+  --latest \
+  --anonymize \
+  --anonymize-credentials \
+  --shift-time-seconds=-86400 \
+  --output-dir curl-export-anonymous
+```
+
+| Option | Effect |
+|---|---|
+| `--anonymize` | Consistent replacements for device IDs, serial/ESN, advertising IDs, session IDs, partition keys, Cast names, boot IDs and SDK invocation IDs; also replaces the user ID in `/dms/api/devices/user/...`, source IP metadata, and removes conditional `if-none-match` headers. |
+| `--anonymize-credentials` | Replace authorization/cookies, token/token2/h/h2 fields, API keys, secrets and Sentry DSN keys with placeholders. Such requests need new credentials before they can authenticate. |
+| `--shift-time-seconds N` | Shift recognized ISO/epoch second/millisecond timestamps, including Sentry `started`; keep durations and unset zero timestamps unchanged. |
+| `--anonymize-field NAME` | Pseudonymize another JSON field, header or query name; repeat as needed (e.g. `--anonymize-field model`). Names ignore case, hyphens and underscores. |
+| `--anonymize-seed VALUE` | Use consistent pseudonyms across separate exports. Without it, a new random mapping is used for each export. Also accepts `JITCA_ANONYMIZE_SEED`; the seed and original-to-replacement map are not saved. |
+| `--aws-resign` | Generate curl signing options using `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and optional `AWS_SESSION_TOKEN` at execution time for captured Kinesis/Firehose requests. No captured AWS credentials are reused. |
+
+Transforms include JSON inside headers, URL query strings, base64 AWS `Records[].Data`
+(JSON or Firehose key/value text), and Sentry envelopes. Changed Sentry item lengths
+and body hashes/sizes are recalculated. The exported manifest contains transformed
+values and references only transformed bodies; original previews and capture
+filenames are removed. Original input logs/captures are never changed. Unknown
+body formats are skipped rather than copied unmodified during anonymization.
+
+For an authenticated feature-flag experiment, use `--anonymize` alone to retain
+your bearer token. This can still associate requests with its account/application.
+Model, firmware, capabilities, country/language and bundle selection remain
+unchanged unless selected with `--anonymize-field`; they affect server responses.
+This targets known fields, not arbitrary encoded secrets in unknown formats.
+
+Any transformed AWS request has its captured authorization/signature replaced
+with a fresh-signature placeholder. Add `--aws-resign` to generate a usable signing
+command instead:
+
+```bash
+python ../scripts/export-curl.py \
+  --hostname kinesis.us-west-2.amazonaws.com \
+  --anonymize --aws-resign --latest \
+  --output-dir curl-export-aws
+# Supply credentials you control in your local shell before running commands.sh.
+```
+
+The credentials need permission for the named streams. Anonymization does not
+grant access, create credentials, or refresh a captured signature without the
+signing secret. Exporting remains entirely offline.
