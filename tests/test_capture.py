@@ -42,13 +42,13 @@ def test_raw_request_and_response_bodies_are_captured_unredacted(tmp_path):
     by_direction = {f.name.split("_")[-2]: f for f in files}
     assert by_direction["request"].read_bytes() == secret          # raw, not redacted
     assert by_direction["response"].read_bytes() == b'{"accepted":true}'
-    # The event log keeps redacting and only references the capture file.
+    # Event logs inherit the unredacted capture policy.
     flow = next(e for e in events if e["event"] == "http_flow")
-    assert "s3cr3t-value" not in json.dumps(events)
+    assert "s3cr3t-value" in json.dumps(events)
     assert flow["request_capture"]["file"] == by_direction["request"].name
     assert flow["request_capture"]["bytes"] == len(secret) and flow["request_capture"]["truncated"] is False
     assert flow["response_capture"]["file"] == by_direction["response"].name
-    assert "token" in flow["request_preview"] and "[REDACTED]" in flow["request_preview"]
+    assert "token" in flow["request_preview"] and "s3cr3t-value" in flow["request_preview"]
 
 
 def test_non_json_binary_body_is_captured_byte_for_byte(tmp_path):

@@ -110,6 +110,7 @@ class Config:
     dns_forward: DNSForward | None = None
     ntp: NTPConfig | None = None
     plain_http: PlainHTTP | None = None
+    log_redact: bool = True
 
     def endpoint_for(self, hostname: str) -> Endpoint | None:
         """Explicit endpoint, else the default-allow template bound to this hostname."""
@@ -226,7 +227,13 @@ def load_config(filename: str | Path) -> Config:
             raise ValueError("capture.max_files must be between 1 and 100000")
         if enabled:
             capture = CaptureConfig(max_capture_body, max_capture_files, redact)
-    log_stdout = raw.get("logging", {}).get("stdout", False)
+    logging = raw.get("logging", {})
+    if not isinstance(logging, dict):
+        raise ValueError("logging must be a table")
+    log_redact = logging.get("redact", capture.redact if capture is not None else True)
+    if not isinstance(log_redact, bool):
+        raise ValueError("logging.redact must be true or false")
+    log_stdout = logging.get("stdout", False)
     if not isinstance(log_stdout, bool):
         raise ValueError("logging.stdout must be true or false")
     answer_all = net.get("dns_answer_all", False)
@@ -322,4 +329,4 @@ def load_config(filename: str | Path) -> Config:
                   tuple(chain_ref(x) for x in cert.get("chain_files", [])),
                   ca_dir, default_issuer,
                   leaf_days, leaf_key, max_body, backend_timeout, response_limit, answer_all,
-                  default_endpoint, default_max, capture, log_stdout, dns_forward, ntp, plain_http)
+                  default_endpoint, default_max, capture, log_stdout, dns_forward, ntp, plain_http, log_redact)

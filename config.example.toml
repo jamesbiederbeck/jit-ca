@@ -102,7 +102,7 @@ body = '{"accepted":true,"source":"jitca"}'
 # body = '{"observed":true}'
 
 # Optional raw body capture: writes every non-empty request/response body, UNREDACTED, to
-# <state_dir>/captures/ (0600). events.jsonl stays redacted and only names the capture file.
+# <state_dir>/captures/ (0600). events.jsonl inherits capture.redact unless logging.redact overrides it.
 # redact = true stores key-name-redacted JSON instead and skips non-JSON bodies.
 # [capture]
 # enabled = true
@@ -113,3 +113,7 @@ body = '{"accepted":true,"source":"jitca"}'
 # Optional: also print every event (the same JSON line as events.jsonl) to stdout.
 # [logging]
 # stdout = true
+
+# Event redaction defaults to capture.redact when capture is enabled, otherwise true.
+# [logging]
+# redact = false  # preserve Authorization/Cookie headers, query values and JSON previews

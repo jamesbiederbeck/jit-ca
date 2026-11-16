@@ -296,3 +296,29 @@ def test_log_stdout_environment_builds_logging_table(tmp_path):
     assert load_config(config).log_stdout is True
     result, config, _ = run_entrypoint(tmp_path, JITCA_ENDPOINTS="x.example")
     assert result.returncode == 0 and load_config(config).log_stdout is False
+
+
+@pytest.mark.parametrize('value,expected', [('false', False), ('true', True), ('', False)])
+def test_log_redaction_override_and_capture_inheritance(tmp_path, value, expected):
+    result, config, _ = run_entrypoint(tmp_path, JITCA_ENDPOINTS='x.example',
+                                      JITCA_CAPTURE_BODIES='true', JITCA_CAPTURE_REDACT='false',
+                                      JITCA_LOG_REDACT=value)
+    assert result.returncode == 0, result.stderr
+    assert load_config(config).log_redact is expected
+
+
+def test_log_redaction_invalid_environment_rejected(tmp_path):
+    result, _, _ = run_entrypoint(tmp_path, JITCA_ENDPOINTS='x.example', JITCA_LOG_REDACT='maybe')
+    assert result.returncode != 0 and 'JITCA_LOG_REDACT must be true or false' in result.stderr
+
+
+def test_new_compose_redaction_defaults_keep_manual_config(tmp_path):
+    env = dict(JITCA_ENDPOINTS='x.example', JITCA_CAPTURE_BODIES='true')
+    first, config, _ = run_entrypoint(tmp_path, **env)
+    assert first.returncode == 0, first.stderr
+    config.write_text(config.read_text() + '\n[[endpoints]]\nhostname = "manual.example"\n')
+    expected = config.read_text()
+    second, _, _ = run_entrypoint(tmp_path, **env, JITCA_CAPTURE_REDACT='false', JITCA_LOG_REDACT='')
+    assert second.returncode == 0, second.stderr
+    assert config.read_text() == expected
+    assert load_config(config).log_redact is False
