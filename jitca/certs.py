@@ -238,6 +238,7 @@ class CertificateStore:
             # Reissuing cannot extend an issuer-limited certificate's lifetime.
             at_issuer_limit = cert.not_valid_after_utc >= issuer.not_after - timedelta(minutes=1)
             return (san.get_values_for_type(x509.DNSName) == [hostname]
+                    and cert.not_valid_before_utc == issuer.cert.not_valid_before_utc
                     and cert.not_valid_before_utc <= now < cert.not_valid_after_utc <= issuer.not_after
                     and (remaining > renewal_window or at_issuer_limit))
         except (ValueError, TypeError, OSError, InvalidSignature, x509.ExtensionNotFound):
@@ -260,7 +261,7 @@ class CertificateStore:
             leaf_end = min(now + timedelta(days=self.config.leaf_days), issuer.not_after - timedelta(minutes=1))
             if leaf_end <= now:
                 raise ValueError("issuer expires too soon to issue a certificate")
-            leaf_start = max(now - timedelta(days=2), issuer.cert.not_valid_before_utc)
+            leaf_start = issuer.cert.not_valid_before_utc
             cert = (x509.CertificateBuilder()
                     .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)]))
                     .issuer_name(issuer.cert.subject).public_key(key.public_key())

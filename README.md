@@ -292,3 +292,9 @@ Use `--chain parents.pem` to add other parent certificates, `--source DIR` for
 another source, or `--output-dir DIR` to stage and inspect without Docker.
 No network certificate lookup is required. Revocation and real-device acceptance
 are not tested by seeding.
+
+Generated leaves use the selected signing CA certificate's exact `notBefore` timestamp.
+For EM DV TLS CA - G3B this is May 14, 2025 at 00:00:00 UTC. Expiration remains
+bounded by `leaf_days` from issuance and the complete issuer chain's expiration.
+Cached leaves with a different start date are regenerated automatically on use
+following a service restart; no state deletion is required.
