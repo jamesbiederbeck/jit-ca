@@ -365,3 +365,73 @@ are rejected. Use a fresh capture after disabling redaction. Queries are re-enco
 transport headers/framing are rebuilt, and curl decompresses responses: this is
 application-level replay, not byte-identical TCP/TLS replay. The response comes
 from the configured jit-ca fixture/backend; no matching route returns 204.
+
+### Export curl commands from an event log
+
+`scripts/export-curl.py` reads `http_request` events and their referenced body
+captures, then writes a portable bundle containing `commands.sh`, `headers/`,
+`bodies/`, and `manifest.json`. It also prints the generated shell script unless
+`--quiet` is set. It never executes curl or sends any requests. Requires only
+Python 3 to export; running the generated script requires bash and curl.
+
+From `local_deployment/`:
+
+```bash
+python ../scripts/export-curl.py \
+  --events state/events.jsonl \
+  --captures state/captures \
+  --output-dir curl-export \
+  --latest
+```
+
+Filter and export just the feature-flag requests:
+
+```bash
+python ../scripts/export-curl.py \
+  --hostname fflags.lokistore.vzolab.com \
+  --path /api/v1/client/featureflags/ \
+  --output-dir curl-export-flags \
+  --latest
+```
+
+Each command includes the original method, application headers, reconstructed
+query string and byte-for-byte captured body. Credentials are retained in private
+header files; query credentials remain in the generated URLs. No anonymization
+or redaction is performed. `--latest` keeps the last request per host, method,
+path and query-value combination, so home and WatchFree feature-flag queries
+remain distinct. Repeat `--hostname` for multiple hosts; `--method` and `--limit`
+provide additional filters. Non-request events are ignored to avoid counting
+`http_request` and `http_flow` twice.
+
+The default `--target origin` uses normal DNS and TLS trust to target the original
+public host. Merely generating the bundle does not send anything. Review it,
+then explicitly run `bash curl-export/commands.sh` when ready. Responses are saved
+under the bundle's `responses/` directory, indexed by request number. HTTP error
+statuses are recorded but do not make curl exit nonzero by default; transport
+failures stop the generated script.
+
+To generate requests for your local jit-ca listener instead:
+
+```bash
+set -a
+. ./.env
+set +a
+python ../scripts/export-curl.py --target local --latest --output-dir curl-export-local
+```
+
+Local mode uses `--ip` / `JITCA_REPLAY_IP`, falling back to `JITCA_REDIRECT_IPV4`
+and then loopback; `--port` / `JITCA_REPLAY_PORT` override the scheme-specific
+`JITCA_TLS_PORT` or `JITCA_HTTP_PORT` (443/80 fallback). Host and SNI stay original.
+For HTTPS, `--cafile` / `JITCA_REPLAY_CAFILE` defaults to the bundled AAA root and
+is copied into the export. `--events`, `--captures`, `--output-dir` and `--target`
+also accept `JITCA_REPLAY_EVENTS`, `JITCA_REPLAY_CAPTURES`, `JITCA_CURL_OUTPUT_DIR`
+and `JITCA_CURL_TARGET`. `.env` is not loaded automatically.
+
+Missing, modified, truncated, redacted or out-of-directory body captures are
+skipped with reasons in `manifest.json`; bodies are never reconstructed from
+previews. Export refuses an existing output directory. Files are private
+(0600, shell script 0700). This is application-level replay: query encoding,
+transport framing and response compression may differ. Recorded AWS signatures
+are preserved, not refreshed; expired signatures and signatures affected by
+query reconstruction may fail. Review captured credentials for expiration.
+Generated exports contain credentials and identifiers and must not be committed.

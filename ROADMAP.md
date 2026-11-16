@@ -28,6 +28,7 @@ This file tracks implementation status at a glance. Update it in the same change
 | Automatic VLAN/device identification | Missing |
 | HTTP/2, MQTT, WebSockets | Missing |
 | Captured HTTP request replay through curl (`scripts/replay.py`), with CLI/environment parameters | Implemented |
+| Offline export of curl commands, headers and captured bodies (`scripts/export-curl.py`) | Implemented |
 | Interactive response editing and stateful replay | Missing |
 | Stateful cloud-service emulation | Missing |
 | Physical-device compatibility testing | Not verified |

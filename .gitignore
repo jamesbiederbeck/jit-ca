@@ -17,3 +17,7 @@ local_deployment/state/
 # replay response artifacts can contain device credentials
 replay-response.headers
 replay-response.body
+
+# generated curl bundles include original credentials and identifiers
+curl-export/
+curl-export-*/
