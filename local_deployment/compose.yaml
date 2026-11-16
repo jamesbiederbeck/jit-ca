@@ -38,8 +38,10 @@ services:
       JITCA_ENDPOINTS: ${JITCA_ENDPOINTS:-}
       JITCA_DEFAULT_ISSUER: ${JITCA_DEFAULT_ISSUER:-}
       JITCA_LEAF_KEY: ${JITCA_LEAF_KEY:-p256}
-      # Raw request/response bodies -> state/captures (unredacted, 0600; events.jsonl stays redacted).
+      # Raw request/response bodies -> state/captures; logs inherit capture redaction unless overridden.
       JITCA_CAPTURE_BODIES: ${JITCA_CAPTURE_BODIES:-true}
+      JITCA_CAPTURE_REDACT: ${JITCA_CAPTURE_REDACT:-false}
+      JITCA_LOG_REDACT: ${JITCA_LOG_REDACT:-}
       # Also print every event as a JSON line to stdout (docker compose logs); events.jsonl is still written.
       JITCA_LOG_STDOUT: ${JITCA_LOG_STDOUT:-true}
     volumes:

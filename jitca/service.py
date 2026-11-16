@@ -442,12 +442,16 @@ def _redact(value):
     return value
 
 
-def _safe_preview(body: bytes):
+def _log_value(value, redact: bool):
+    return _redact(value) if redact else value
+
+
+def _safe_preview(body: bytes, redact: bool = True):
     if not body:
         return ""
     try:
         payload = json.loads(body)
-        return json.dumps(_redact(payload), ensure_ascii=False)[:4096]
+        return json.dumps(_log_value(payload, redact), ensure_ascii=False)[:4096]
     except (ValueError, UnicodeDecodeError):
         return "[non-JSON body omitted]"
 
@@ -545,14 +549,14 @@ class _TLSHandler(socketserver.BaseRequestHandler):
             stream = wrapped.makefile("rb")
             method, target, version, headers, request_body = _read_http(stream, ctrl.config.max_body_bytes)
             parsed = urlsplit(target)
-            parameters = _redact(parse_qs(parsed.query, keep_blank_values=True, max_num_fields=1000))
-            public_headers = _redact(headers)
+            parameters = _log_value(parse_qs(parsed.query, keep_blank_values=True, max_num_fields=1000), ctrl.config.log_redact)
+            public_headers = _log_value(headers, ctrl.config.log_redact)
             request_details = dict(source=client_ip, hostname=hostname, method=method,
                                    default_endpoint=hostname not in ctrl.config.endpoints,
                                    path=parsed.path, query_parameters=parameters,
                                    request_headers=public_headers, request_bytes=len(request_body),
                                    request_sha256=hashlib.sha256(request_body).hexdigest(),
-                                   request_preview=_safe_preview(request_body))
+                                   request_preview=_safe_preview(request_body, ctrl.config.log_redact))
             if ctrl.capture is not None:
                 saved = ctrl.capture.save(ctrl.log, "request", hostname, request_body)
                 if saved:
@@ -577,7 +581,7 @@ class _TLSHandler(socketserver.BaseRequestHandler):
                     response_details["response_capture"] = saved
             ctrl.log.emit("http_flow", **request_details, **response_details, status=result.status,
                           tls_version=wrapped.version(), cipher=wrapped.cipher()[0],
-                          response_preview=_safe_preview(result.body))
+                          response_preview=_safe_preview(result.body, ctrl.config.log_redact))
         except (ssl.SSLError, OSError, ValueError, UnicodeError) as exc:
             ctrl.log.emit("tls_or_http_error", source=client_ip, error=str(exc))
             if wrapped is not None:
@@ -631,11 +635,11 @@ class _PlainHTTPHandler(socketserver.BaseRequestHandler):
                                    host_header=host_header[:255], method=method,
                                    default_endpoint=bool(hostname) and hostname not in ctrl.config.endpoints,
                                    path=parsed.path,
-                                   query_parameters=_redact(parse_qs(parsed.query, keep_blank_values=True,
-                                                                      max_num_fields=1000)),
-                                   request_headers=_redact(headers), request_bytes=len(request_body),
+                                   query_parameters=_log_value(parse_qs(parsed.query, keep_blank_values=True,
+                                                                      max_num_fields=1000), ctrl.config.log_redact),
+                                   request_headers=_log_value(headers, ctrl.config.log_redact), request_bytes=len(request_body),
                                    request_sha256=hashlib.sha256(request_body).hexdigest(),
-                                   request_preview=_safe_preview(request_body))
+                                   request_preview=_safe_preview(request_body, ctrl.config.log_redact))
             label = hostname or "unknown-host"
             if ctrl.capture is not None:
                 saved = ctrl.capture.save(ctrl.log, "request", label, request_body)
@@ -655,7 +659,7 @@ class _PlainHTTPHandler(socketserver.BaseRequestHandler):
                 if saved:
                     response_details["response_capture"] = saved
             ctrl.log.emit("http_flow", **request_details, **response_details, status=result.status,
-                          response_preview=_safe_preview(result.body))
+                          response_preview=_safe_preview(result.body, ctrl.config.log_redact))
         except (OSError, ValueError, UnicodeError) as exc:
             ctrl.log.emit("http_plain_error", source=client_ip, error=str(exc))
             try:

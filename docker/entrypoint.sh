@@ -21,6 +21,7 @@
 #   JITCA_CAPTURE_BODIES         true|false: write raw request/response bodies to <state>/captures (false)
 #   JITCA_CAPTURE_MAX_BODY_BYTES per-body cap (262144); JITCA_CAPTURE_MAX_FILES file cap (1000)
 #   JITCA_CAPTURE_REDACT         true|false: store key-name-redacted JSON only, skip non-JSON (false)
+#   JITCA_LOG_REDACT             true|false: override event redaction (default: inherit capture.redact when enabled)
 #   JITCA_LOG_STDOUT             true|false: also print each event (JSON line) to stdout / `docker logs` (false)
 #   JITCA_LEAF_KEY               rsa2048|p256 (default rsa2048)
 #   JITCA_LEAF_DAYS              leaf validity in days (default 30)
@@ -72,6 +73,8 @@ answer_all=$(bool JITCA_DNS_ANSWER_ALL false)
 default_endpoint=$(bool JITCA_DEFAULT_ENDPOINT false)
 capture=$(bool JITCA_CAPTURE_BODIES false)
 log_stdout=$(bool JITCA_LOG_STDOUT false)
+log_redact=""
+[[ -z ${JITCA_LOG_REDACT:-} ]] || log_redact=$(bool JITCA_LOG_REDACT true)
 capture_redact=$(bool JITCA_CAPTURE_REDACT false)
 capture_body=${JITCA_CAPTURE_MAX_BODY_BYTES:-262144}
 capture_files=${JITCA_CAPTURE_MAX_FILES:-1000}
@@ -101,7 +104,8 @@ mkdir -p "$state" "$config_dir"
 hash_stdin() { sha256sum | cut -d' ' -f1; }
 env_hash() {
     {
-        env | { grep '^JITCA_' || true; } | { grep -v '^JITCA_NO_EXEC=' || true; } | sort
+        # Newly exposed Compose defaults must not invalidate existing hand-edited configs.
+        env | { grep '^JITCA_' || true; } | { grep -vE '^(JITCA_NO_EXEC=|JITCA_LOG_REDACT=$|JITCA_CAPTURE_REDACT=false$)' || true; } | sort
         if [[ -n ${JITCA_EXTRA_CONFIG:-} && -f ${JITCA_EXTRA_CONFIG} ]]; then sha256sum "$JITCA_EXTRA_CONFIG"; fi
     } | hash_stdin
 }
@@ -132,8 +136,9 @@ generate_config() {
         echo "leaf_key = $(toml_string "$leaf_key")"
         echo "[http]"
         echo "max_body_bytes = 65536"
-        if [[ $log_stdout == true ]]; then
-            printf '[logging]\nstdout = true\n'
+        if [[ $log_stdout == true || -n $log_redact ]]; then
+            printf '[logging]\nstdout = %s\n' "$log_stdout"
+            [[ -z $log_redact ]] || printf 'redact = %s\n' "$log_redact"
         fi
         if [[ $capture == true ]]; then
             printf '[capture]\nenabled = true\nmax_body_bytes = %s\nmax_files = %s\nredact = %s\n' \
