@@ -7,6 +7,7 @@ import threading
 
 from .certs import CertificateStore
 from .config import load_config
+from .observed import endpoint_stanzas, summarize
 from .service import JITCAService
 
 
@@ -19,13 +20,16 @@ def main(argv=None):
     sub.add_parser("issuer", help="Show issuer validity and test CA location")
     events = sub.add_parser("events", help="Print recorded JSONL observations")
     events.add_argument("--tail", type=int, default=20)
+    observed = sub.add_parser("observed", help="Summarize hostnames seen in recorded events")
+    observed.add_argument("--toml", action="store_true",
+                          help="Print [[endpoints]] stanzas for observed hostnames not yet configured")
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
     if args.command == "serve":
         service = JITCAService(cfg)
         service.start()
         print(f"JIT CA DNS {service.dns_address}; HTTPS {service.tls_address}", flush=True)
-        print(f"Issuer mode: {cfg.issuer_mode}; endpoints: {', '.join(cfg.endpoints)}", flush=True)
+        print(f"Issuer mode: {cfg.issuer_mode}; endpoints: {', '.join(cfg.endpoints) or '(none)'}", flush=True)
         print("Ctrl-C to stop", flush=True)
         try:
             threading.Event().wait()
@@ -46,6 +50,9 @@ def main(argv=None):
                               "not_before": store.issuer_cert.not_valid_before_utc.isoformat(),
                               "not_after": store.not_after.isoformat(),
                               "demo_ca_cert": str(store.root_ca_path) if store.root_ca_path else None}, indent=2))
+    elif args.command == "observed":
+        summary = summarize(cfg.state_dir / "events.jsonl", frozenset(cfg.endpoints))
+        print(endpoint_stanzas(summary) if args.toml else json.dumps(summary, indent=2))
     elif args.command == "events":
         path = cfg.state_dir / "events.jsonl"
         if path.exists():

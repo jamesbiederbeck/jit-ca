@@ -9,6 +9,9 @@ tls_port = 18443
 # Override for NAT, containers, or a different externally reachable gateway:
 # redirect_ipv4 = "192.0.2.10"
 allowed_clients = ["127.0.0.1/32", "::1/128"]
+# Answer EVERY A query with redirect_ipv4 instead of REFUSED for unknown names
+# (needs redirect_ipv4; never issues certificates for non-endpoint names):
+# dns_answer_all = true
 
 [certificates]
 mode = "local"                  # use a locally generated DEMO CA
@@ -61,3 +64,28 @@ body = '{"accepted":true,"source":"jitca"}'
 # path_prefix = "/api/"
 # proxy_pass = "http://127.0.0.1:9000"
 # headers = { X-Emulator = "local" }
+
+# Optional default-allow: any hostname not listed above that a client reaches over TLS
+# gets an on-demand leaf certificate and is served by these routes (none => 204) and
+# logged with default_endpoint = true. max_hostnames bounds how many distinct names are
+# signed per run. In directory issuer mode this needs certificates.default_issuer.
+# Review what was seen with `jitca observed`; `jitca observed --toml` prints
+# [[endpoints]] stanzas to promote observed names.
+# [default_endpoint]
+# max_hostnames = 100
+# [[default_endpoint.routes]]
+# path_prefix = "/"
+# body = '{"observed":true}'
+
+# Optional raw body capture: writes every non-empty request/response body, UNREDACTED, to
+# <state_dir>/captures/ (0600). events.jsonl stays redacted and only names the capture file.
+# redact = true stores key-name-redacted JSON instead and skips non-JSON bodies.
+# [capture]
+# enabled = true
+# max_body_bytes = 262144
+# max_files = 1000
+# redact = false
+
+# Optional: also print every event (the same JSON line as events.jsonl) to stdout.
+# [logging]
+# stdout = true

@@ -6,12 +6,14 @@ import os
 from pathlib import Path
 import queue
 import threading
+from typing import TextIO
 
 
 class EventLog:
     """Queue observations without disk I/O in network or certificate workers."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, echo: TextIO | None = None):
+        self._echo = echo  # optional mirror (stdout); never allowed to break the file log
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.path = path
         self._lock = threading.Lock()
@@ -35,7 +37,14 @@ class EventLog:
             self._queue.put_nowait(record)
 
     def _write(self, record: dict) -> None:
-        self._stream.write(json.dumps(record, default=str) + "\n")
+        line = json.dumps(record, default=str) + "\n"
+        self._stream.write(line)
+        if self._echo is not None:
+            try:
+                self._echo.write(line)
+                self._echo.flush()
+            except Exception:
+                self._echo = None  # stdout went away (closed pipe); keep logging to the file
 
     def _work(self) -> None:
         try:

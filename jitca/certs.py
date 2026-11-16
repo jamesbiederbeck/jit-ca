@@ -171,6 +171,7 @@ class CertificateStore:
                              self.not_after, self.issuer_cert.subject.rfc4514_string())
             self.issuers = {"local": issuer}
             self.endpoint_issuer = {hostname: "local" for hostname in cfg.endpoints}
+            self.default_issuer_label = "local"
         elif cfg.issuer_mode == "external":
             self.root_ca_path = None
             self.issuer_cert = x509.load_pem_x509_certificate(cfg.issuer_cert.read_bytes())
@@ -184,6 +185,7 @@ class CertificateStore:
                              self.not_after, self.issuer_cert.subject.rfc4514_string())
             self.issuers = {"external": issuer}
             self.endpoint_issuer = {hostname: "external" for hostname in cfg.endpoints}
+            self.default_issuer_label = "external"
         else:
             self.root_ca_path = None
             self.issuer_cert = None
@@ -193,9 +195,18 @@ class CertificateStore:
             self.issuer_id = None
             self.issuers = _load_ca_directory(cfg.ca_dir)
             self.endpoint_issuer = _resolve_endpoint_issuers(cfg, self.issuers)
+            self.default_issuer_label = None
+            if cfg.default_endpoint is not None:
+                needle = cfg.default_issuer.lower()
+                matches = [label for label, rec in self.issuers.items() if needle in rec.subject.lower()]
+                if len(matches) != 1:
+                    raise ValueError(f"default_issuer {cfg.default_issuer!r} for default_endpoint "
+                                     f"matched {len(matches)} CA(s) in {cfg.ca_dir}")
+                self.default_issuer_label = matches[0]
 
     def _issuer_for(self, hostname: str) -> _Issuer:
-        return self.issuers[self.endpoint_issuer[hostname]]
+        label = self.endpoint_issuer.get(hostname) or self.default_issuer_label
+        return self.issuers[label]
 
     def _path(self, hostname: str) -> Path:
         issuer = self._issuer_for(hostname)
@@ -230,7 +241,7 @@ class CertificateStore:
 
     def get_or_issue(self, hostname: str) -> tuple[Path, Path, bool]:
         hostname = canonical_hostname(hostname)
-        if hostname not in self.config.endpoints:
+        if hostname not in self.config.endpoints and self.config.default_endpoint is None:
             raise PermissionError(f"hostname not approved: {hostname}")
         with self._lock:
             issuer = self._issuer_for(hostname)

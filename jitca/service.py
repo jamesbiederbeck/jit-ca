@@ -9,7 +9,9 @@ import socket
 import socketserver
 import ssl
 import struct
+import sys
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlsplit
 from http.client import HTTPException
@@ -19,19 +21,27 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
+from .capture import BodyCapture
 from .certs import CertificateStore, _save_private, _private_pem
 from .config import Config, canonical_hostname
 from .events import EventLog
 from .http import Response, encode_response, respond, select_route
 
 
-def _issue_and_log(store: CertificateStore, log: EventLog, hostname: str) -> None:
+def _issue_and_log(store: CertificateStore, log: EventLog, hostname: str, trigger: str = "prewarm") -> str:
+    """Issue (or confirm) a leaf and log the outcome; returns "issued", "cached" or "error"."""
+    started = time.monotonic()
     try:
         cert_path, _, issued = store.get_or_issue(hostname)
-        log.emit("cert_prewarmed", hostname=hostname, new=issued,
-                 certificate=str(cert_path.relative_to(store.config.state_dir)))
     except Exception as exc:
-        log.emit("cert_prewarm_error", hostname=hostname, error=str(exc))
+        log.emit("cert_prewarm_error", hostname=hostname, trigger=trigger,
+                 error_type=type(exc).__name__, error=str(exc),
+                 elapsed_ms=round((time.monotonic() - started) * 1000, 1))
+        return "error"
+    log.emit("cert_prewarmed", hostname=hostname, new=issued, trigger=trigger,
+             certificate=str(cert_path.relative_to(store.config.state_dir)),
+             elapsed_ms=round((time.monotonic() - started) * 1000, 1))
+    return "issued" if issued else "cached"
 
 
 class CertificatePrewarmer:
@@ -86,6 +96,14 @@ class CertificatePrewarmer:
             self.thread.join()
 
 
+class DNSNameError(ValueError):
+    """A well-formed query whose name is not a valid hostname; keeps the raw name for logging."""
+
+    def __init__(self, message: str, qname: str):
+        super().__init__(message)
+        self.qname = qname
+
+
 def _parse_dns_question(payload: bytes):
     if len(payload) < 17:
         raise ValueError("short DNS query")
@@ -124,16 +142,24 @@ def _parse_dns_question(payload: bytes):
     if question_end + 4 > len(payload):
         raise ValueError("truncated question")
     qtype, qclass = struct.unpack("!HH", payload[question_end:question_end+4])
-    hostname = canonical_hostname(".".join(labels))
+    raw_name = ".".join(labels)
+    try:
+        hostname = canonical_hostname(raw_name)
+    except ValueError as exc:
+        raise DNSNameError(str(exc), raw_name[:253]) from exc
     return ident, flags, hostname, qtype, qclass, payload[12:question_end+4]
 
 
 def _dns_response(payload: bytes, config: Config, client_ip: str = "127.0.0.1"):
     ident, flags, hostname, qtype, qclass, question = _parse_dns_question(payload)
     approved = hostname in config.endpoints
-    rcode = 0 if approved else 5  # REFUSED for unknown hostnames (no forwarding in POC).
+    # Unknown hostnames are REFUSED (no forwarding in POC) unless the operator opted
+    # in to answering every query with the configured redirect address. Catch-all
+    # answers never trigger certificate issuance: only explicit endpoints are signed.
+    answerable = approved or config.dns_answer_all
+    rcode = 0 if answerable else 5
     answer = b""
-    if approved and qtype == 1 and qclass == 1:
+    if answerable and qtype == 1 and qclass == 1:
         answer = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 30, 4)
         redirect = config.redirect_ipv4
         if redirect is None:
@@ -149,29 +175,48 @@ def _dns_response(payload: bytes, config: Config, client_ip: str = "127.0.0.1"):
     return header + question + answer, hostname, approved, qtype, bool(answer)
 
 
+DNS_RCODES = {0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 4: "NOTIMP", 5: "REFUSED"}
+
+
 class _DNSHandler(socketserver.BaseRequestHandler):
     def handle(self):
         data, sock = self.request
         controller = self.server.controller
-        if not controller.config.allows_client(self.client_address[0]):
-            controller.log.emit("dns_denied", source=self.client_address[0])
+        source = self.client_address[0]
+        started = time.monotonic()
+        if not controller.config.allows_client(source):
+            controller.log.emit("dns_denied", source=source, bytes=len(data))
             return
         try:
             response, hostname, approved, qtype, answered = _dns_response(
-                data, controller.config, self.client_address[0])
+                data, controller.config, source)
         except (ValueError, UnicodeDecodeError, OSError) as exc:
-            controller.log.emit("dns_invalid", source=self.client_address[0], error=str(exc))
+            controller.log.emit("dns_invalid", source=source, bytes=len(data),
+                                qname=getattr(exc, "qname", None), error=str(exc))
             return
-        controller.log.emit("dns_query", source=self.client_address[0], hostname=hostname,
-                            qtype=qtype, intercepted=approved)
-        if approved:
-            if answered:
-                # Hold the reply until the leaf certificate is actually ready, so the
-                # client's TLS handshake never hits a signing cache-miss.
-                _issue_and_log(controller.store, controller.log, hostname)
-            else:
-                controller.prewarmer.request(hostname)
-        sock.sendto(response, self.client_address)
+        cert = None
+        if approved and answered:
+            # Hold the reply until the leaf certificate is actually ready, so the
+            # client's TLS handshake never hits a signing cache-miss.
+            cert = _issue_and_log(controller.store, controller.log, hostname, trigger="dns")
+        rcode = response[3] & 0x0F
+        # What jit-ca did with the query. `intercepted` only means "explicit endpoint" and is kept
+        # for compatibility; `action` is the field to read.
+        if answered:
+            action = "endpoint" if approved else "catch_all"
+        else:
+            action = "nodata" if rcode == 0 else "refused"
+        controller.log.emit("dns_query", source=source, hostname=hostname, qtype=qtype,
+                            action=action, intercepted=approved, catch_all=answered and not approved,
+                            rcode=DNS_RCODES.get(rcode, rcode),
+                            answer=socket.inet_ntoa(response[-4:]) if answered else None,
+                            cert=cert, elapsed_ms=round((time.monotonic() - started) * 1000, 1))
+        if approved and not answered:
+            controller.prewarmer.request(hostname)
+        try:
+            sock.sendto(response, self.client_address)
+        except OSError as exc:
+            controller.log.emit("dns_reply_error", source=source, hostname=hostname, error=str(exc))
 
 
 class _DNSServer(socketserver.ThreadingUDPServer):
@@ -279,6 +324,23 @@ def _http_response(status: int, body: bytes, content_type: str) -> bytes:
     return header + body
 
 
+def classify_handshake_error(exc: BaseException) -> tuple[str, str | None]:
+    """Return (category, OpenSSL reason) for a failed server-side TLS handshake."""
+    reason = getattr(exc, "reason", None)
+    text = str(exc).lower()
+    if isinstance(exc, TimeoutError) or "timed out" in text:
+        return "timeout", reason
+    if isinstance(exc, (ssl.SSLEOFError, ConnectionError)) or "eof occurred" in text:
+        return "connection_closed", reason
+    if reason == "CALLBACK_FAILED":
+        return "sni_rejected", reason  # our SNI callback refused the name (see tls_sni_denied)
+    if reason and "ALERT" in reason:
+        return "client_alert", reason  # the client aborted, e.g. TLSV1_ALERT_UNKNOWN_CA
+    if reason and any(word in reason for word in ("PROTOCOL", "VERSION", "CIPHER", "HTTP", "CURVE", "SIGNATURE")):
+        return "protocol_mismatch", reason
+    return "other", reason
+
+
 class _TLSHandler(socketserver.BaseRequestHandler):
     def handle(self):
         ctrl = self.server.controller
@@ -291,7 +353,16 @@ class _TLSHandler(socketserver.BaseRequestHandler):
         stream = None
         try:
             wrapped = ctrl.base_ssl.wrap_socket(self.request, server_side=True, do_handshake_on_connect=False)
-            wrapped.do_handshake()
+            started = time.monotonic()
+            try:
+                wrapped.do_handshake()
+            except OSError as exc:  # includes ssl.SSLError and timeouts
+                category, reason = classify_handshake_error(exc)
+                ctrl.log.emit("tls_handshake_failed", source=client_ip,
+                              sni=getattr(wrapped, "_jitca_sni", None), category=category,
+                              reason=reason, error_type=type(exc).__name__, error=str(exc),
+                              elapsed_ms=round((time.monotonic() - started) * 1000, 1))
+                return
             hostname = getattr(wrapped, "_jitca_hostname", None)
             if hostname is None:
                 raise ValueError("no selected hostname")
@@ -301,24 +372,34 @@ class _TLSHandler(socketserver.BaseRequestHandler):
             parameters = _redact(parse_qs(parsed.query, keep_blank_values=True, max_num_fields=1000))
             public_headers = _redact(headers)
             request_details = dict(source=client_ip, hostname=hostname, method=method,
+                                   default_endpoint=hostname not in ctrl.config.endpoints,
                                    path=parsed.path, query_parameters=parameters,
                                    request_headers=public_headers, request_bytes=len(request_body),
                                    request_sha256=hashlib.sha256(request_body).hexdigest(),
                                    request_preview=_safe_preview(request_body))
+            if ctrl.capture is not None:
+                saved = ctrl.capture.save(ctrl.log, "request", hostname, request_body)
+                if saved:
+                    request_details["request_capture"] = saved
             ctrl.log.emit("http_request", **request_details)
             host_header = headers.get("host", "")
             # Host and SNI must match; no cross-vhost routing.
             if canonical_hostname(host_header.split(":")[0]) != hostname:
                 result = Response(403, b'{"error":"Host/SNI mismatch"}', {"content-type": "application/json"})
             else:
-                route = select_route(ctrl.config.endpoints[hostname], method, parsed.path)
+                route = select_route(ctrl.config.endpoint_for(hostname), method, parsed.path)
                 try:
                     result = respond(ctrl.config, route, method, target, headers, request_body)
                 except (HTTPException, OSError, ValueError) as exc:
                     ctrl.log.emit("backend_error", hostname=hostname, path=parsed.path, error=str(exc))
                     result = Response(502, b'{"error":"backend unavailable"}', {"content-type": "application/json"})
             wrapped.sendall(encode_response(result, method))
-            ctrl.log.emit("http_flow", **request_details, status=result.status,
+            response_details = {}
+            if ctrl.capture is not None:
+                saved = ctrl.capture.save(ctrl.log, "response", hostname, result.body)
+                if saved:
+                    response_details["response_capture"] = saved
+            ctrl.log.emit("http_flow", **request_details, **response_details, status=result.status,
                           tls_version=wrapped.version(), cipher=wrapped.cipher()[0],
                           response_preview=_safe_preview(result.body))
         except (ssl.SSLError, OSError, ValueError, UnicodeError) as exc:
@@ -348,14 +429,18 @@ class JITCAService:
     def __init__(self, config: Config):
         self.config = config
         config.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.log = EventLog(config.state_dir / "events.jsonl")
+        self.log = EventLog(config.state_dir / "events.jsonl", **({"echo": sys.stdout} if config.log_stdout else {}))
         self._lifecycle_lock = threading.RLock()
+        self._default_lock = threading.Lock()
+        self._default_hosts: set[str] = set()
         self._state = "new"
         self._servers = []
         self._running_servers = []
         self.threads: list[threading.Thread] = []
         try:
             self.store = CertificateStore(config)
+            self.capture = (BodyCapture(config.state_dir / "captures", config.capture, _redact)
+                            if config.capture else None)
             self.prewarmer = CertificatePrewarmer(self.store, self.log)
             self.base_ssl = _bootstrap_context(config.state_dir / "certificates")
             self.base_ssl.sni_callback = self._sni_callback
@@ -378,6 +463,8 @@ class JITCAService:
         return self.tls_server.server_address
 
     def _sni_callback(self, ssl_obj: ssl.SSLSocket, servername: str | None, initial: ssl.SSLContext):
+        if servername:
+            ssl_obj._jitca_sni = servername[:253]  # for tls_handshake_failed, even if the name is rejected
         if servername is None:
             self.log.emit("tls_sni_denied", reason="missing SNI")
             return ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
@@ -386,16 +473,47 @@ class JITCAService:
         except ValueError:
             return ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
         if hostname not in self.config.endpoints:
-            self.log.emit("tls_sni_denied", hostname=hostname, reason="not allowlisted")
-            return ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
+            if self.config.default_endpoint is None:
+                self.log.emit("tls_sni_denied", hostname=hostname, reason="not allowlisted")
+                return ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
+            if not self._claim_default_hostname(hostname):
+                self.log.emit("tls_sni_denied", hostname=hostname,
+                              reason="default_endpoint max_hostnames reached")
+                return ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
+        started = time.monotonic()
         try:
             context, issued = self.store.ssl_context(hostname)
             ssl_obj.context = context
             ssl_obj._jitca_hostname = hostname
-            self.log.emit("tls_certificate_selected", hostname=hostname, new=issued)
+            self.log.emit("tls_certificate_selected", hostname=hostname, new=issued,
+                          elapsed_ms=round((time.monotonic() - started) * 1000, 1))
         except Exception as exc:
-            self.log.emit("tls_cert_error", hostname=hostname, error=str(exc))
+            self.log.emit("tls_cert_error", hostname=hostname, error_type=type(exc).__name__,
+                          error=str(exc), elapsed_ms=round((time.monotonic() - started) * 1000, 1))
             return ssl.ALERT_DESCRIPTION_INTERNAL_ERROR
+
+    def _log_issuers(self) -> None:
+        """Record which CAs are loaded and warn about any that expire soon."""
+        now = datetime.now(timezone.utc)
+        issuers = {label: {"subject": issuer.subject, "not_after": issuer.not_after.isoformat()}
+                   for label, issuer in self.store.issuers.items()}
+        self.log.emit("cert_issuers", mode=self.config.issuer_mode,
+                      default_issuer=self.config.default_issuer, issuers=issuers)
+        for label, issuer in self.store.issuers.items():
+            days_left = (issuer.not_after - now).days
+            if days_left < 30:
+                self.log.emit("cert_issuer_expiring", issuer=label, subject=issuer.subject,
+                              not_after=issuer.not_after.isoformat(), days_left=days_left)
+
+    def _claim_default_hostname(self, hostname: str) -> bool:
+        """Bound how many distinct non-endpoint names may get on-demand certificates."""
+        with self._default_lock:
+            if hostname in self._default_hosts:
+                return True
+            if len(self._default_hosts) >= self.config.default_max_hostnames:
+                return False
+            self._default_hosts.add(hostname)
+            return True
 
     def start(self):
         with self._lifecycle_lock:
@@ -410,6 +528,7 @@ class JITCAService:
                     thread.start()
                     self.threads.append(thread)
                     self._running_servers.append(server)
+                self._log_issuers()
                 self.log.emit("service_started", dns_address=self.dns_address, tls_address=self.tls_address)
             except BaseException:
                 self.stop()

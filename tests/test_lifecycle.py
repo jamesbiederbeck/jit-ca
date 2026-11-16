@@ -170,7 +170,7 @@ def test_failed_handshake_and_successful_request_close_tls_sockets(tmp_path, mon
         service.stop()
     assert len(sockets) == 2
     assert all(wrapped.fileno() == -1 for wrapped in sockets)
-    assert any(record["event"] == "tls_or_http_error" for record in events(service))
+    assert any(record["event"] == "tls_handshake_failed" for record in events(service))
     assert_stopped(service)
 
 

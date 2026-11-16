@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import ipaddress
 import re
@@ -50,6 +50,13 @@ class Endpoint:
 
 
 @dataclass(frozen=True)
+class CaptureConfig:
+    max_body_bytes: int = 262144
+    max_files: int = 1000
+    redact: bool = False
+
+
+@dataclass(frozen=True)
 class Config:
     path: Path
     state_dir: Path
@@ -71,6 +78,18 @@ class Config:
     max_body_bytes: int
     backend_timeout_seconds: float = 5
     max_response_bytes: int = 1048576
+    dns_answer_all: bool = False
+    default_endpoint: Endpoint | None = None
+    default_max_hostnames: int = 100
+    capture: CaptureConfig | None = None
+    log_stdout: bool = False
+
+    def endpoint_for(self, hostname: str) -> Endpoint | None:
+        """Explicit endpoint, else the default-allow template bound to this hostname."""
+        endpoint = self.endpoints.get(hostname)
+        if endpoint is None and self.default_endpoint is not None:
+            endpoint = replace(self.default_endpoint, hostname=hostname)
+        return endpoint
 
     def allows_client(self, ip: str) -> bool:
         address = ipaddress.ip_address(ip)
@@ -84,11 +103,7 @@ def load_config(filename: str | Path) -> Config:
     net = raw.get("network", {})
     cert = raw.get("certificates", {})
     tls = raw.get("http", {})
-    endpoints = {}
-    for item in raw.get("endpoints", []):
-        hostname = canonical_hostname(item["hostname"])
-        if hostname in endpoints:
-            raise ValueError(f"duplicate endpoint: {hostname}")
+    def parse_routes(item):
         routes = []
         for record in item.get("routes", []):
             method = record.get("method", "*").upper()
@@ -127,9 +142,27 @@ def load_config(filename: str | Path) -> Config:
                 raise ValueError("duplicate route")
             routes.append(Route(method, route_path, status, str(record.get("body", "")),
                                 content_type, prefix, backend, headers))
-        issuer_selector = item.get("issuer")
-        endpoints[hostname] = Endpoint(hostname, tuple(routes), issuer_selector)
-    if not endpoints:
+        return tuple(routes)
+
+    endpoints = {}
+    for item in raw.get("endpoints", []):
+        hostname = canonical_hostname(item["hostname"])
+        if hostname in endpoints:
+            raise ValueError(f"duplicate endpoint: {hostname}")
+        endpoints[hostname] = Endpoint(hostname, parse_routes(item), item.get("issuer"))
+    default_endpoint = None
+    default_max = 100
+    if "default_endpoint" in raw:
+        record = raw["default_endpoint"]
+        if not isinstance(record, dict):
+            raise ValueError("default_endpoint must be a table")
+        if "hostname" in record or "issuer" in record:
+            raise ValueError("default_endpoint cannot set hostname or issuer")
+        default_max = int(record.get("max_hostnames", 100))
+        if not 1 <= default_max <= 10000:
+            raise ValueError("default_endpoint.max_hostnames must be between 1 and 10000")
+        default_endpoint = Endpoint("*", parse_routes(record), None)
+    if not endpoints and default_endpoint is None:
         raise ValueError("configure at least one explicit endpoint")
 
     mode = cert.get("mode", "local")
@@ -149,6 +182,31 @@ def load_config(filename: str | Path) -> Config:
     if redirect is not None:
         if ipaddress.IPv4Address(redirect).is_unspecified:
             raise ValueError("redirect_ipv4 must be a concrete IPv4 address")
+    capture = None
+    if "capture" in raw:
+        record = raw["capture"]
+        if not isinstance(record, dict):
+            raise ValueError("capture must be a table")
+        enabled = record.get("enabled", False)
+        redact = record.get("redact", False)
+        if not isinstance(enabled, bool) or not isinstance(redact, bool):
+            raise ValueError("capture.enabled and capture.redact must be true or false")
+        max_capture_body = int(record.get("max_body_bytes", 262144))
+        max_capture_files = int(record.get("max_files", 1000))
+        if not 1 <= max_capture_body <= 16777216:
+            raise ValueError("capture.max_body_bytes must be between 1 and 16777216")
+        if not 1 <= max_capture_files <= 100000:
+            raise ValueError("capture.max_files must be between 1 and 100000")
+        if enabled:
+            capture = CaptureConfig(max_capture_body, max_capture_files, redact)
+    log_stdout = raw.get("logging", {}).get("stdout", False)
+    if not isinstance(log_stdout, bool):
+        raise ValueError("logging.stdout must be true or false")
+    answer_all = net.get("dns_answer_all", False)
+    if not isinstance(answer_all, bool):
+        raise ValueError("network.dns_answer_all must be true or false")
+    if answer_all and redirect is None:
+        raise ValueError("network.dns_answer_all requires network.redirect_ipv4")
     state = (path.parent / cert.get("state_dir", "./state")).resolve()
     leaf_days = int(cert.get("leaf_days", 30))
     if not 1 <= leaf_days <= 197:
@@ -164,6 +222,8 @@ def load_config(filename: str | Path) -> Config:
     if mode == "directory":
         if not ca_dir:
             raise ValueError("directory issuer mode needs certificates.ca_dir")
+        if default_endpoint is not None and not default_issuer:
+            raise ValueError("default_endpoint in directory mode needs certificates.default_issuer")
         for hostname, endpoint in endpoints.items():
             if not endpoint.issuer and not default_issuer:
                 raise ValueError(f"endpoint {hostname} has no issuer selector and "
@@ -183,4 +243,5 @@ def load_config(filename: str | Path) -> Config:
                   mode, file_ref("issuer_cert"), file_ref("issuer_key"),
                   tuple(chain_ref(x) for x in cert.get("chain_files", [])),
                   ca_dir, default_issuer,
-                  leaf_days, leaf_key, max_body, backend_timeout, response_limit)
+                  leaf_days, leaf_key, max_body, backend_timeout, response_limit, answer_all,
+                  default_endpoint, default_max, capture, log_stdout)
