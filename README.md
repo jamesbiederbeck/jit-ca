@@ -261,3 +261,34 @@ This is **not yet a replacement for mitmproxy, Squid, or roomba-cloud**. Specifi
 The HTTP rule dispatcher is separated from the TLS listener. Extend it with stateful local API handlers, and consider **mitmproxy** as an optional HTTP/TLS transport after confirming its certificate-store injection API permits DNS prewarming. Deploy DNS observation through CoreDNS (or a local resolver plugin) so non-intercepted names resolve normally.
 
 The POC establishes the critical sequencing claim: DNS prewarming can produce a certificate **before** the device's TLS `ClientHello`, and SNI can select that certificate **without** generating it during the handshake.
+
+### Seed the local deployment CA volume
+
+From the repository root, with Python dependencies installed and Docker running:
+
+```bash
+git submodule update --init third_party/emudrahahahahaha
+python scripts/seed-ca-volume.py
+mkdir -p local_deployment/config local_deployment/state
+docker compose -f local_deployment/compose.yaml up -d --build --force-recreate
+```
+
+The script defaults to the local deployment's `ca-src-private` volume and uid/gid
+1000 (override with `--uid`/`--gid` or `LOCAL_UID`/`LOCAL_GID`). It validates every
+cert/key pair and verifies parent signatures before touching Docker, then copies
+private mode-0600 pairs with the requested ownership. Existing unrelated volume
+files are retained; stop the service before reseeding a volume in use. The upstream
+files are signing CA certificates, not endpoint leaves. All eight pairs are seeded;
+the existing importer selects the six TLS-server CAs and excludes code-signing CAs.
+Each `<stem>.pem` contains the signing intermediate followed by its parent root;
+directory mode preserves this chain when generating endpoint leaves.
+
+The bundled public `local_deployment/aaa-certificate-services.crt` is the legacy
+AAA Certificate Services root from the certifi 2024.08.30 bundle
+(https://github.com/certifi/python-certifi/blob/2024.08.30/certifi/cacert.pem),
+SHA-256 `d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4`.
+It is supplied as chain material, not installed into the host trust store.
+Use `--chain parents.pem` to add other parent certificates, `--source DIR` for
+another source, or `--output-dir DIR` to stage and inspect without Docker.
+No network certificate lookup is required. Revocation and real-device acceptance
+are not tested by seeding.

@@ -101,11 +101,15 @@ def _load_ca_directory(ca_dir: Path) -> dict[str, _Issuer]:
         key_path = pem_path.with_suffix(".key")
         if not key_path.exists():
             raise ValueError(f"missing private key for {pem_path.name}")
-        cert = x509.load_pem_x509_certificate(pem_path.read_bytes())
+        chain = x509.load_pem_x509_certificates(pem_path.read_bytes())
+        cert = chain[0]
         key = serialization.load_pem_private_key(key_path.read_bytes(), password=None)
         _check_issuer_pair(cert, key)
-        chain = [cert]
-        issuers[pem_path.stem] = _Issuer(cert, key, tuple(), _issuer_id(chain),
+        for child, parent in zip(chain, chain[1:]):
+            child.verify_directly_issued_by(parent)
+            if not parent.extensions.get_extension_for_class(x509.BasicConstraints).value.ca:
+                raise ValueError("issuer chain parent is not a CA")
+        issuers[pem_path.stem] = _Issuer(cert, key, tuple(chain[1:]), _issuer_id(chain),
                                          _chain_not_after(chain), cert.subject.rfc4514_string())
     return issuers
 

@@ -19,7 +19,7 @@ This file tracks implementation status at a glance. Update it in the same change
 | Default-allow endpoint: on-demand TLS leaf and request logging for unlisted hostnames (capped), `jitca observed` summary | Implemented |
 | Container entrypoint: env-driven config generation and CA-volume import via `discover-issuers.sh`, with persistent config reconciled against the CA volume on start | Implemented |
 | Optional stdout mirror of the event log, plus Docker log rotation in the local compose | Implemented |
-| Local deployment (`local_deployment/`): bind-mounted `ca-src/`, `config/`, `state/` | Implemented |
+| Local deployment (`local_deployment/`): external CA volume, bind-mounted `config/` and `state/`; validated full-chain seeding script | Implemented |
 | Opt-in raw request/response body capture to `state/captures` (private files, size and count caps, optional redaction) | Implemented |
 | General-purpose DNS forwarding | Missing |
 | Plain HTTP (port 80) listener | Missing |
