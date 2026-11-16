@@ -1,0 +1,7 @@
+# Demo endpoint with a static route; enable with JITCA_EXTRA_CONFIG=/app/docker/robot-demo.toml
+[[endpoints]]
+hostname = "robot.example.test"
+[[endpoints.routes]]
+method = "GET"
+path = "/status"
+body = '{"robot":{"connected":true,"mode":"idle"},"source":"jitca"}'

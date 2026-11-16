@@ -51,7 +51,35 @@ Run with Docker (optional; requires Docker Engine/Compose):
 docker compose up --build
 ```
 
-Compose publishes **loopback-only** ports and uses a named state volume. `demo.py` expects the CA file in local `./state`, so use the Python path for the full demo, or copy the test CA certificate from the container using `docker compose cp jitca:/state/certificates/demo-root.crt ./demo-root.crt` and adapt the client CA path.
+The image's entrypoint (`docker/entrypoint.sh`) builds the jitca config from `JITCA_*` environment variables, imports operator CA pairs from the CA volume with `scripts/discover-issuers.sh`, then runs `jitca serve`. The generated config is `config.toml` in `JITCA_CONFIG_DIR` (default `/state`); the examples below use that path. run other subcommands with e.g. `docker compose exec jitca jitca --config /state/config.toml observed`.
+
+| Variable | Meaning (default) |
+|---|---|
+| `JITCA_ENDPOINTS` | comma/space separated hostnames to serve as explicit endpoints (none) |
+| `JITCA_EXTRA_CONFIG` | TOML file appended verbatim, for endpoints with routes or `proxy_pass` (`compose.yaml` sets `/app/docker/robot-demo.toml`) |
+| `JITCA_REDIRECT_IPV4` | address DNS answers with; required for answer-all (compose: `127.0.0.1`; set it to the host's LAN address to serve devices) |
+| `JITCA_ALLOWED_CLIENTS` | comma/space separated CIDRs (`127.0.0.1/32`; the compose files use the same default) |
+| `JITCA_DNS_ANSWER_ALL` | `true` answers every A query with the redirect address (`false`; compose: `true`) |
+| `JITCA_DEFAULT_ENDPOINT` / `JITCA_DEFAULT_MAX_HOSTNAMES` | default-allow endpoint and its cap (`false` / 100; compose: `true` / 200) |
+| `JITCA_LEAF_KEY`, `JITCA_LEAF_DAYS` | leaf key type and validity (`rsa2048`, 30) |
+| `JITCA_DEFAULT_ISSUER` | CA subject substring; needed when the CA volume holds more than one CA |
+| `JITCA_LOG_STDOUT` | also print each event as a JSON line to stdout (`false`; local deployment: `true`) |
+| `JITCA_CAPTURE_BODIES` (+ `_MAX_BODY_BYTES`, `_MAX_FILES`, `_REDACT`) | raw body capture to `<state>/captures` (`false`; local deployment: `true`) |
+| `JITCA_CONFIG_DIR` | where `config.toml` and the stamp live (default: the state dir) |
+
+Values are validated (hostnames, CIDRs, IPv4, booleans) before they reach the config, and a bad value aborts startup.
+
+**Config persistence and reconciliation:** the config and a stamp file (`.entrypoint-stamp`) persist in `JITCA_CONFIG_DIR`. The config is regenerated (previous copy saved as `config.toml.bak`) only when there is none, the `JITCA_*` environment changed (including the contents of `JITCA_EXTRA_CONFIG`), or `JITCA_REGENERATE_CONFIG=1`; otherwise your manual edits are kept. On every start the certificate entries (`mode`, `ca_dir`, `default_issuer` and the staged copies in `<state>/issuers`) are checked against the CA volume. If the volume has CA pairs the config doesn't reference, its pairs changed since the config was built, or the staged copies were altered or removed, the entries are deleted and rebuilt. If the volume has become empty, they are reset to the local demo CA. Nothing else in the config is touched. Compose reads each variable from your shell or `.env` first, so `JITCA_REDIRECT_IPV4=192.0.2.10 docker compose up -d` overrides the default.
+
+**Local deployment:** `local_deployment/compose.yaml` is a self-contained variant. `config/` (generated config + stamp) and `state/` (certificates, events, captures, staged issuers) are bind mounts next to the compose file, and the CA pairs come from an external named volume, `ca-src-private`, mounted read-only (create it with `docker volume create ca-src-private` and copy the `<stem>.pem`/`<stem>.key` pairs in, as in the CA volume example below). It runs as your host uid/gid (`LOCAL_UID`/`LOCAL_GID`, default 1000) so the bind mounts stay writable, and builds from the repo root. Copy `local_deployment/.env.example` to `local_deployment/.env` and uncomment what you need (the defaults bind loopback only); `.env`, `config/`, `state/` and `ca-src/` are git-ignored. Start it with `docker compose -f local_deployment/compose.yaml up -d --build`.
+
+**CA volume:** the root compose mounts the named volume `ca-cert` read-only at `/ca-src`. Put `<stem>.pem`/`<stem>.key` pairs in it (readable by uid 10001). On start the entrypoint clears `/state/issuers`, keeps only pairs OpenSSL reports as `SSL server CA : Yes`, copies them there mode `0600` and switches to `directory` mode. An empty volume means the local demo CA. If the volume has `.pem` files but none is a usable CA, startup fails rather than silently falling back to the demo CA. For example:
+
+```bash
+docker run --rm -v jit-ca-codex_ca-cert:/ca -v "$PWD/third_party/emudrahahahahaha:/src:ro" alpine sh -c 'cp /src/*.pem /src/*.key /ca/ && chown 10001 /ca/*'
+```
+
+Compose publishes on loopback only by default (host ports 15353/udp and 18443/tcp), and uses named volumes for state and CAs. To serve devices set `JITCA_BIND_ADDRESS` to the host's LAN address, `JITCA_DNS_PORT=53` and `JITCA_TLS_PORT=443`, plus `JITCA_REDIRECT_IPV4` and `JITCA_ALLOWED_CLIENTS`; `local_deployment/.env.example` lists every variable. `demo.py` expects the CA file in local `./state`, so use the Python path for the full demo, or copy the demo CA from the container using `docker compose cp jitca:/state/certificates/demo-root.crt ./demo-root.crt` and adapt the client CA path.
 
 ## How it works
 

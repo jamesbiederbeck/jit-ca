@@ -1,0 +1,12 @@
+.git
+.venv
+.pytest_cache
+**/__pycache__
+*.egg-info
+state*/
+issuer/
+third_party/
+config.toml
+config.bench*.toml
+config.isolated.*.toml
+tests/

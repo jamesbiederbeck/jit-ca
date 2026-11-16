@@ -1,0 +1,60 @@
+# Local deployment: everything the container reads or writes lives next to this file.
+#   ca-src-private (external named volume)  operator CA <stem>.pem/<stem>.key pairs, mounted read-only at
+#            /ca-src. Create it first (docker volume create ca-src-private) and copy the pairs in.
+#   config/  generated config.toml + entrypoint stamp (persistent; reconciled against the CA volume on start)
+#   state/   certificates, events.jsonl, staged issuers
+# Runs as your host uid/gid so the bind mounts stay writable: LOCAL_UID/LOCAL_GID default to 1000.
+name: jitca-local
+services:
+  jitca:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: jitca-local
+    restart: unless-stopped
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    ports:
+      # Loopback and unprivileged host ports by default. To serve devices, set JITCA_BIND_ADDRESS to the
+      # host's LAN address and JITCA_DNS_PORT=53 / JITCA_TLS_PORT=443 in .env (see .env.example).
+      # jitca's DNS is UDP-only. The container is non-root with cap_drop ALL; docker-proxy binds the
+      # host ports.
+      - "${JITCA_BIND_ADDRESS:-127.0.0.1}:${JITCA_DNS_PORT:-15353}:15353/udp"
+      - "${JITCA_BIND_ADDRESS:-127.0.0.1}:${JITCA_TLS_PORT:-18443}:18443/tcp"
+    environment:
+      # docker/entrypoint.sh builds config/config.toml from these (regenerated only when they change).
+      JITCA_CONFIG_DIR: /config
+      JITCA_REDIRECT_IPV4: ${JITCA_REDIRECT_IPV4:-127.0.0.1}
+      JITCA_ALLOWED_CLIENTS: ${JITCA_ALLOWED_CLIENTS:-127.0.0.1/32}
+      JITCA_DNS_ANSWER_ALL: ${JITCA_DNS_ANSWER_ALL:-true}
+      JITCA_DEFAULT_ENDPOINT: ${JITCA_DEFAULT_ENDPOINT:-true}
+      JITCA_DEFAULT_MAX_HOSTNAMES: ${JITCA_DEFAULT_MAX_HOSTNAMES:-200}
+      JITCA_ENDPOINTS: ${JITCA_ENDPOINTS:-}
+      JITCA_DEFAULT_ISSUER: ${JITCA_DEFAULT_ISSUER:-}
+      JITCA_LEAF_KEY: ${JITCA_LEAF_KEY:-p256}
+      # Raw request/response bodies -> state/captures (unredacted, 0600; events.jsonl stays redacted).
+      JITCA_CAPTURE_BODIES: ${JITCA_CAPTURE_BODIES:-true}
+      # Also print every event as a JSON line to stdout (docker compose logs); events.jsonl is still written.
+      JITCA_LOG_STDOUT: ${JITCA_LOG_STDOUT:-true}
+    volumes:
+      - ./state:/state
+      - ./config:/config
+      - ca-src-private:/ca-src:ro
+    # Docker keeps the container's stdout/stderr; rotate it so it cannot fill the disk:
+    # 5 files of up to 10 MB each (50 MB max), older ones gzip-compressed.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+        compress: "true"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+
+volumes:
+  ca-src-private:
+    external: true

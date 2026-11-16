@@ -3,10 +3,27 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "127.0.0.1:15353:15353/udp"
-      - "127.0.0.1:18443:18443/tcp"
+      # Loopback and unprivileged host ports by default. To serve devices, set JITCA_BIND_ADDRESS to the
+      # host's LAN address and JITCA_DNS_PORT=53 / JITCA_TLS_PORT=443 (a resolver already listening on
+      # :53 there will conflict). jitca's DNS is UDP-only (no TCP/53). The container itself stays
+      # non-root with cap_drop ALL; docker-proxy binds the host ports.
+      - "${JITCA_BIND_ADDRESS:-127.0.0.1}:${JITCA_DNS_PORT:-15353}:15353/udp"
+      - "${JITCA_BIND_ADDRESS:-127.0.0.1}:${JITCA_TLS_PORT:-18443}:18443/tcp"
+    environment:
+      # The entrypoint builds the jitca config from these on every start (docker/entrypoint.sh).
+      JITCA_REDIRECT_IPV4: ${JITCA_REDIRECT_IPV4:-127.0.0.1}
+      JITCA_ALLOWED_CLIENTS: ${JITCA_ALLOWED_CLIENTS:-127.0.0.1/32}
+      JITCA_DNS_ANSWER_ALL: ${JITCA_DNS_ANSWER_ALL:-true}
+      JITCA_DEFAULT_ENDPOINT: ${JITCA_DEFAULT_ENDPOINT:-true}
+      JITCA_DEFAULT_MAX_HOSTNAMES: ${JITCA_DEFAULT_MAX_HOSTNAMES:-200}
+      JITCA_ENDPOINTS: ${JITCA_ENDPOINTS:-}
+      JITCA_EXTRA_CONFIG: ${JITCA_EXTRA_CONFIG:-/app/docker/robot-demo.toml}
+      JITCA_DEFAULT_ISSUER: ${JITCA_DEFAULT_ISSUER:-}
+      JITCA_LEAF_KEY: ${JITCA_LEAF_KEY:-rsa2048}
     volumes:
       - jitca_state:/state
+      # Pool of operator CA <stem>.pem/<stem>.key pairs; empty => local demo CA.
+      - ca-cert:/ca-src:ro
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -17,3 +34,4 @@ services:
 
 volumes:
   jitca_state:
+  ca-cert:

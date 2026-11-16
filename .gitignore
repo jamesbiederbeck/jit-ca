@@ -1,7 +1,15 @@
 state/
+state-*/
 *.egg-info/
 __pycache__/
 .pytest_cache/
 .venv/
 config.toml
 issuer/
+
+# local deployment: operator CA material, generated config and runtime state
+local_deployment/ca-src/
+local_deployment/cert_bak/
+local_deployment/.env
+local_deployment/config/
+local_deployment/state/
