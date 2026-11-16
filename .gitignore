@@ -13,3 +13,7 @@ local_deployment/cert_bak/
 local_deployment/.env
 local_deployment/config/
 local_deployment/state/
+
+# replay response artifacts can contain device credentials
+replay-response.headers
+replay-response.body

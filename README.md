@@ -317,3 +317,51 @@ For EM DV TLS CA - G3B this is May 14, 2025 at 00:00:00 UTC. Expiration remains
 bounded by `leaf_days` from issuance and the complete issuer chain's expiration.
 Cached leaves with a different start date are regenerated automatically on use
 following a service restart; no state deletion is required.
+
+### Replay a captured request
+
+`scripts/replay.py` selects the latest `http_request` matching a hostname and/or
+path, or reads one event JSON object with `--event-file`. It replays the recorded
+method, headers, query values and complete body through curl to a chosen jit-ca
+listener while retaining the original Host/SNI. It does not replay against the
+public origin by default. Requires Python 3 and curl; no extra Python packages.
+
+From `local_deployment/`, export your deployment environment and run:
+
+```bash
+set -a
+. ./.env
+set +a
+python ../scripts/replay.py \
+  --hostname api.sctv.prod.smartcasttv.com \
+  --path /loki/feature-cards/announcements
+```
+
+The connection IP defaults to `JITCA_REPLAY_IP`, then `JITCA_REDIRECT_IPV4`, then
+loopback. Set `--ip` or `JITCA_REPLAY_IP` to override. CLI arguments take precedence
+over environment defaults. Nothing automatically reads `.env`; the example exports it.
+
+| Option | Environment | Default |
+|---|---|---|
+| `--events` | `JITCA_REPLAY_EVENTS` | `state/events.jsonl` |
+| `--event-file` | `JITCA_REPLAY_EVENT_FILE` | Select from event log |
+| `--captures` | `JITCA_REPLAY_CAPTURES` | `captures/` next to event log |
+| `--hostname` | `JITCA_REPLAY_HOSTNAME` | Any hostname |
+| `--path` | `JITCA_REPLAY_PATH` | Any path |
+| `--ip` | `JITCA_REPLAY_IP` | Deployment redirect IP, else loopback |
+| `--port` | `JITCA_REPLAY_PORT` | `JITCA_TLS_PORT`/`JITCA_HTTP_PORT`, else 443/80 |
+| `--scheme` | `JITCA_REPLAY_SCHEME` | Recorded scheme; HTTPS if absent |
+| `--cafile` | `JITCA_REPLAY_CAFILE` | Bundled AAA root |
+| `--output-prefix` | `JITCA_REPLAY_OUTPUT_PREFIX` | `replay-response` |
+| `--connect-timeout` | `JITCA_REPLAY_CONNECT_TIMEOUT` | 5 seconds |
+| `--timeout` | `JITCA_REPLAY_TIMEOUT` | 30 seconds |
+
+TLS and hostname verification remain enabled. Use `--cafile` for another issuer.
+Response headers/body are saved as `<prefix>.headers` and `<prefix>.body`, mode
+0600; credentials and response bodies are not printed. Header credentials are
+passed via a private temporary file rather than command-line arguments. Recorded
+redacted values, missing/truncated/redacted bodies, or body hash/size mismatches
+are rejected. Use a fresh capture after disabling redaction. Queries are re-encoded,
+transport headers/framing are rebuilt, and curl decompresses responses: this is
+application-level replay, not byte-identical TCP/TLS replay. The response comes
+from the configured jit-ca fixture/backend; no matching route returns 204.

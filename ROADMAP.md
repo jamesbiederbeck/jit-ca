@@ -27,7 +27,8 @@ This file tracks implementation status at a glance. Update it in the same change
 | Opt-in plain HTTP listener and body capture point (`[plain_http]`; Host-header vhosts, same routes/capture/logging as TLS) | Implemented |
 | Automatic VLAN/device identification | Missing |
 | HTTP/2, MQTT, WebSockets | Missing |
-| Interactive response editing and replay | Missing |
+| Captured HTTP request replay through curl (`scripts/replay.py`), with CLI/environment parameters | Implemented |
+| Interactive response editing and stateful replay | Missing |
 | Stateful cloud-service emulation | Missing |
 | Physical-device compatibility testing | Not verified |
 
