@@ -20,6 +20,13 @@ services:
       # host ports.
       - "${JITCA_BIND_ADDRESS:-127.0.0.1}:${JITCA_DNS_PORT:-15353}:15353/udp"
       - "${JITCA_BIND_ADDRESS:-127.0.0.1}:${JITCA_TLS_PORT:-18443}:18443/tcp"
+      # NTP (UDP). The container is non-root with cap_drop ALL, so jitca must listen on the unprivileged
+      # container port 12123 ([ntp] port = 12123 in config.toml); docker-proxy publishes it on the host.
+      # Set JITCA_NTP_PORT=123 in .env to serve devices on the standard port.
+      - "${JITCA_BIND_ADDRESS:-127.0.0.1}:${JITCA_NTP_PORT:-12123}:12123/udp"
+      # Plain HTTP capture point (TCP). Same non-root reasoning: jitca listens on container port 18080
+      # ([plain_http] port = 18080 in config.toml); set JITCA_HTTP_PORT=80 in .env for the standard port.
+      - "${JITCA_BIND_ADDRESS:-127.0.0.1}:${JITCA_HTTP_PORT:-18080}:18080/tcp"
     environment:
       # docker/entrypoint.sh builds config/config.toml from these (regenerated only when they change).
       JITCA_CONFIG_DIR: /config

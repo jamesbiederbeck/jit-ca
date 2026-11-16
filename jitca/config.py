@@ -57,6 +57,30 @@ class CaptureConfig:
 
 
 @dataclass(frozen=True)
+class DNSForward:
+    """Exact hostnames whose DNS queries are relayed to a real upstream resolver."""
+    upstream: str
+    port: int
+    timeout_seconds: float
+    hostnames: frozenset[str]
+
+
+@dataclass(frozen=True)
+class NTPConfig:
+    """Optional SNTP responder; `host` of None means the DNS bind address."""
+    host: str | None
+    port: int
+    stratum: int
+
+
+@dataclass(frozen=True)
+class PlainHTTP:
+    """Optional cleartext HTTP/1.1 listener; `host` of None means the TLS bind address."""
+    host: str | None
+    port: int
+
+
+@dataclass(frozen=True)
 class Config:
     path: Path
     state_dir: Path
@@ -83,6 +107,9 @@ class Config:
     default_max_hostnames: int = 100
     capture: CaptureConfig | None = None
     log_stdout: bool = False
+    dns_forward: DNSForward | None = None
+    ntp: NTPConfig | None = None
+    plain_http: PlainHTTP | None = None
 
     def endpoint_for(self, hostname: str) -> Endpoint | None:
         """Explicit endpoint, else the default-allow template bound to this hostname."""
@@ -207,6 +234,57 @@ def load_config(filename: str | Path) -> Config:
         raise ValueError("network.dns_answer_all must be true or false")
     if answer_all and redirect is None:
         raise ValueError("network.dns_answer_all requires network.redirect_ipv4")
+    dns_forward = None
+    if "dns_forward" in raw:
+        record = raw["dns_forward"]
+        if not isinstance(record, dict):
+            raise ValueError("dns_forward must be a table")
+        upstream = record.get("upstream")
+        if not isinstance(upstream, str):
+            raise ValueError("dns_forward.upstream must be an IPv4 or IPv6 address")
+        ipaddress.ip_address(upstream)
+        fwd_port = int(record.get("port", 53))
+        fwd_timeout = float(record.get("timeout_seconds", 2))
+        if not 1 <= fwd_port <= 65535:
+            raise ValueError("dns_forward.port must be between 1 and 65535")
+        if not 0 < fwd_timeout <= 30:
+            raise ValueError("dns_forward.timeout_seconds must be between 0 and 30")
+        names = record.get("hostnames", [])
+        if not isinstance(names, list) or not names:
+            raise ValueError("dns_forward.hostnames must be a non-empty list")
+        forwarded = frozenset(canonical_hostname(name) for name in names)
+        overlap = forwarded & set(endpoints)
+        if overlap:
+            raise ValueError("dns_forward.hostnames overlap [[endpoints]]: "
+                             + ", ".join(sorted(overlap)))
+        dns_forward = DNSForward(upstream, fwd_port, fwd_timeout, forwarded)
+    ntp = None
+    if "ntp" in raw:
+        record = raw["ntp"]
+        if not isinstance(record, dict):
+            raise ValueError("ntp must be a table")
+        ntp_host = record.get("host")
+        if ntp_host is not None:
+            ipaddress.ip_address(ntp_host)
+        ntp_port = int(record.get("port", 123))
+        ntp_stratum = int(record.get("stratum", 2))
+        if not 0 <= ntp_port <= 65535:
+            raise ValueError("ntp.port must be between 0 and 65535")
+        if not 1 <= ntp_stratum <= 15:
+            raise ValueError("ntp.stratum must be between 1 and 15")
+        ntp = NTPConfig(ntp_host, ntp_port, ntp_stratum)
+    plain_http = None
+    if "plain_http" in raw:
+        record = raw["plain_http"]
+        if not isinstance(record, dict):
+            raise ValueError("plain_http must be a table")
+        plain_host = record.get("host")
+        if plain_host is not None:
+            ipaddress.ip_address(plain_host)
+        plain_port = int(record.get("port", 80))
+        if not 0 <= plain_port <= 65535:
+            raise ValueError("plain_http.port must be between 0 and 65535")
+        plain_http = PlainHTTP(plain_host, plain_port)
     state = (path.parent / cert.get("state_dir", "./state")).resolve()
     leaf_days = int(cert.get("leaf_days", 30))
     if not 1 <= leaf_days <= 197:
@@ -244,4 +322,4 @@ def load_config(filename: str | Path) -> Config:
                   tuple(chain_ref(x) for x in cert.get("chain_files", [])),
                   ca_dir, default_issuer,
                   leaf_days, leaf_key, max_body, backend_timeout, response_limit, answer_all,
-                  default_endpoint, default_max, capture, log_stdout)
+                  default_endpoint, default_max, capture, log_stdout, dns_forward, ntp, plain_http)

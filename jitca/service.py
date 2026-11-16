@@ -175,6 +175,87 @@ def _dns_response(payload: bytes, config: Config, client_ip: str = "127.0.0.1"):
     return header + question + answer, hostname, approved, qtype, bool(answer)
 
 
+def _forward_dns(payload: bytes, forward) -> bytes:
+    """Relay one query to the configured upstream resolver; raises OSError/ValueError on failure."""
+    family = socket.AF_INET6 if ":" in forward.upstream else socket.AF_INET
+    with socket.socket(family, socket.SOCK_DGRAM) as upstream:
+        upstream.settimeout(forward.timeout_seconds)
+        upstream.connect((forward.upstream, forward.port))  # connected UDP drops other sources
+        upstream.send(payload)
+        reply = upstream.recv(65535)
+    if len(reply) < 12 or reply[:2] != payload[:2] or not reply[2] & 0x80:
+        raise ValueError("invalid upstream DNS reply")
+    return reply
+
+
+DNS_TYPES = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA", 33: "SRV", 65: "HTTPS"}
+
+
+def _dns_name_at(message: bytes, position: int) -> tuple[str, int]:
+    """Decode a (possibly compressed) name; return (name, offset just past it in the record)."""
+    labels, end, jumps = [], None, 0
+    while True:
+        if position >= len(message):
+            raise ValueError("truncated DNS name")
+        size = message[position]
+        if size & 0xC0 == 0xC0:
+            if position + 1 >= len(message):
+                raise ValueError("truncated DNS compression")
+            if end is None:
+                end = position + 2
+            position = ((size & 0x3F) << 8) | message[position + 1]
+            jumps += 1
+            if jumps > 32:
+                raise ValueError("DNS compression loop")
+            continue
+        if size & 0xC0:
+            raise ValueError("bad DNS label")
+        position += 1
+        if size == 0:
+            return ".".join(labels), position if end is None else end
+        labels.append(message[position:position + size].decode("ascii", "replace"))
+        position += size
+
+
+def _parse_dns_answers(message: bytes, limit: int = 50) -> list[dict]:
+    """Answer-section records of a DNS reply as JSON-friendly dicts; ValueError if malformed."""
+    if len(message) < 12:
+        raise ValueError("short DNS reply")
+    qdcount, ancount = struct.unpack("!HH", message[4:8])
+    position = 12
+    for _ in range(qdcount):
+        _, position = _dns_name_at(message, position)
+        position += 4
+    records = []
+    for _ in range(min(ancount, limit)):
+        name, position = _dns_name_at(message, position)
+        if position + 10 > len(message):
+            raise ValueError("truncated DNS record")
+        rtype, _rclass, ttl, length = struct.unpack("!HHIH", message[position:position + 10])
+        position += 10
+        rdata = message[position:position + length]
+        if len(rdata) != length:
+            raise ValueError("truncated DNS rdata")
+        if rtype == 1 and length == 4:
+            data = str(ipaddress.IPv4Address(rdata))
+        elif rtype == 28 and length == 16:
+            data = str(ipaddress.IPv6Address(rdata))
+        elif rtype in (2, 5, 12):
+            data = _dns_name_at(message, position)[0]
+        elif rtype == 15 and length >= 3:
+            data = f"{struct.unpack('!H', rdata[:2])[0]} {_dns_name_at(message, position + 2)[0]}"
+        else:
+            data = rdata[:64].hex()
+        records.append({"name": name, "type": DNS_TYPES.get(rtype, rtype), "ttl": ttl, "data": data})
+        position += length
+    return records
+
+
+def _servfail(payload: bytes) -> bytes:
+    ident, flags, _hostname, _qtype, _qclass, question = _parse_dns_question(payload)
+    return struct.pack("!HHHHHH", ident, 0x8000 | 0x0080 | (flags & 0x0100) | 2, 1, 0, 0, 0) + question
+
+
 DNS_RCODES = {0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 4: "NOTIMP", 5: "REFUSED"}
 
 
@@ -187,6 +268,15 @@ class _DNSHandler(socketserver.BaseRequestHandler):
         if not controller.config.allows_client(source):
             controller.log.emit("dns_denied", source=source, bytes=len(data))
             return
+        forward = controller.config.dns_forward
+        if forward is not None:
+            try:
+                _, _, fwd_name, fwd_qtype, _, _ = _parse_dns_question(data)
+            except (ValueError, UnicodeDecodeError):
+                fwd_name = None
+            if fwd_name in forward.hostnames:
+                self._forward(data, sock, forward, source, fwd_name, fwd_qtype, started)
+                return
         try:
             response, hostname, approved, qtype, answered = _dns_response(
                 data, controller.config, source)
@@ -217,6 +307,92 @@ class _DNSHandler(socketserver.BaseRequestHandler):
             sock.sendto(response, self.client_address)
         except OSError as exc:
             controller.log.emit("dns_reply_error", source=source, hostname=hostname, error=str(exc))
+
+
+    def _forward(self, data, sock, forward, source, hostname, qtype, started):
+        controller = self.server.controller
+        try:
+            response, action, error = _forward_dns(data, forward), "forward", None
+        except (OSError, ValueError) as exc:
+            response, action, error = _servfail(data), "forward_failed", str(exc) or type(exc).__name__
+        rcode = response[3] & 0x0F
+        answers = answers_error = None
+        if action == "forward":
+            try:
+                answers = _parse_dns_answers(response)
+            except (ValueError, UnicodeError, struct.error) as exc:
+                answers_error = str(exc)  # the reply is still relayed untouched
+        controller.log.emit("dns_query", source=source, hostname=hostname, qtype=qtype,
+                            action=action, intercepted=False, catch_all=False,
+                            rcode=DNS_RCODES.get(rcode, rcode), answers=answers,
+                            answers_error=answers_error, reply_bytes=len(response),
+                            truncated=bool(response[2] & 0x02),
+                            upstream=f"{forward.upstream}:{forward.port}", error=error,
+                            elapsed_ms=round((time.monotonic() - started) * 1000, 1))
+        try:
+            sock.sendto(response, self.client_address)
+        except OSError as exc:
+            controller.log.emit("dns_reply_error", source=source, hostname=hostname, error=str(exc))
+
+
+NTP_UNIX_OFFSET = 2208988800  # seconds between 1900-01-01 and 1970-01-01
+
+
+def _ntp_timestamp(unix_time: float) -> bytes:
+    seconds = int(unix_time)
+    fraction = int((unix_time - seconds) * (1 << 32))
+    return struct.pack("!II", (seconds + NTP_UNIX_OFFSET) & 0xFFFFFFFF, fraction)
+
+
+def _ntp_response(request: bytes, stratum: int, received: float, transmitted: float) -> bytes:
+    """Build an SNTP server reply for a client (mode 3) request; ValueError if not one."""
+    if len(request) < 48:
+        raise ValueError("short NTP packet")
+    version, mode = (request[0] >> 3) & 7, request[0] & 7
+    if mode != 3 or not 1 <= version <= 4:
+        raise ValueError(f"unsupported NTP mode {mode} version {version}")
+    refid = b"LOCL" if stratum == 1 else b"\0\0\0\0"
+    return (struct.pack("!BBBb", (version << 3) | 4, stratum, request[2], -20)
+            + struct.pack("!II", 0, 0x00010000) + refid
+            + _ntp_timestamp(received)       # reference: this host's clock, treated as in sync
+            + request[40:48]                 # originate: the client's transmit timestamp
+            + _ntp_timestamp(received) + _ntp_timestamp(transmitted))
+
+
+class _NTPHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        received = time.time()
+        data, sock = self.request
+        controller = self.server.controller
+        source = self.client_address[0]
+        if not controller.config.allows_client(source):
+            controller.log.emit("ntp_denied", source=source, bytes=len(data))
+            return
+        try:
+            reply = _ntp_response(data, controller.config.ntp.stratum, received, time.time())
+        except ValueError as exc:
+            controller.log.emit("ntp_invalid", source=source, bytes=len(data), error=str(exc))
+            return
+        controller.log.emit("ntp_query", source=source, version=(data[0] >> 3) & 7,
+                            stratum=controller.config.ntp.stratum,
+                            time=datetime.fromtimestamp(received, timezone.utc).isoformat())
+        try:
+            sock.sendto(reply, self.client_address)
+        except OSError as exc:
+            controller.log.emit("ntp_reply_error", source=source, error=str(exc))
+
+
+class _NTPServer(socketserver.ThreadingUDPServer):
+    allow_reuse_address = True
+    daemon_threads = False
+
+    def __init__(self, address, controller):
+        super().__init__(address, _NTPHandler)
+        self.controller = controller
+
+    def server_close(self):
+        self._threads.join()
+        super().server_close()
 
 
 class _DNSServer(socketserver.ThreadingUDPServer):
@@ -425,6 +601,81 @@ class _TLSServer(socketserver.ThreadingTCPServer):
         self.controller = controller
 
 
+class _PlainHTTPHandler(socketserver.BaseRequestHandler):
+    """Cleartext HTTP/1.1 capture point: same routes, logging and body capture as TLS, no SNI.
+
+    The virtual host comes from the Host header. Names without an endpoint (and no default
+    endpoint) are still logged and captured but only get an empty 204.
+    """
+
+    def handle(self):
+        ctrl = self.server.controller
+        client_ip = self.client_address[0]
+        if not ctrl.config.allows_client(client_ip):
+            ctrl.log.emit("http_plain_denied", source=client_ip)
+            return
+        self.request.settimeout(8)
+        stream = None
+        try:
+            stream = self.request.makefile("rb")
+            method, target, version, headers, request_body = _read_http(stream, ctrl.config.max_body_bytes)
+            host_header = headers.get("host", "")
+            try:
+                hostname = canonical_hostname(host_header.rsplit(":", 1)[0] if not host_header.startswith("[")
+                                              else host_header)
+            except ValueError:
+                hostname = None  # missing Host, IP literal or invalid name: observe only
+            endpoint = ctrl.config.endpoint_for(hostname) if hostname else None
+            parsed = urlsplit(target)
+            request_details = dict(scheme="http", source=client_ip, hostname=hostname,
+                                   host_header=host_header[:255], method=method,
+                                   default_endpoint=bool(hostname) and hostname not in ctrl.config.endpoints,
+                                   path=parsed.path,
+                                   query_parameters=_redact(parse_qs(parsed.query, keep_blank_values=True,
+                                                                      max_num_fields=1000)),
+                                   request_headers=_redact(headers), request_bytes=len(request_body),
+                                   request_sha256=hashlib.sha256(request_body).hexdigest(),
+                                   request_preview=_safe_preview(request_body))
+            label = hostname or "unknown-host"
+            if ctrl.capture is not None:
+                saved = ctrl.capture.save(ctrl.log, "request", label, request_body)
+                if saved:
+                    request_details["request_capture"] = saved
+            ctrl.log.emit("http_request", **request_details)
+            route = select_route(endpoint, method, parsed.path) if endpoint else None
+            try:
+                result = respond(ctrl.config, route, method, target, headers, request_body)
+            except (HTTPException, OSError, ValueError) as exc:
+                ctrl.log.emit("backend_error", hostname=hostname, path=parsed.path, error=str(exc))
+                result = Response(502, b'{"error":"backend unavailable"}', {"content-type": "application/json"})
+            self.request.sendall(encode_response(result, method))
+            response_details = {}
+            if ctrl.capture is not None:
+                saved = ctrl.capture.save(ctrl.log, "response", label, result.body)
+                if saved:
+                    response_details["response_capture"] = saved
+            ctrl.log.emit("http_flow", **request_details, **response_details, status=result.status,
+                          response_preview=_safe_preview(result.body))
+        except (OSError, ValueError, UnicodeError) as exc:
+            ctrl.log.emit("http_plain_error", source=client_ip, error=str(exc))
+            try:
+                self.request.sendall(_http_response(400, b'{"error":"invalid request"}', "application/json"))
+            except OSError:
+                pass
+        finally:
+            if stream is not None:
+                stream.close()
+
+
+class _PlainHTTPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = False
+
+    def __init__(self, address, controller):
+        super().__init__(address, _PlainHTTPHandler)
+        self.controller = controller
+
+
 class JITCAService:
     def __init__(self, config: Config):
         self.config = config
@@ -448,6 +699,15 @@ class JITCAService:
             self._servers.append(self.dns_server)
             self.tls_server = _TLSServer((config.tls_host, config.tls_port), self)
             self._servers.append(self.tls_server)
+            self.http_server = None
+            if config.plain_http is not None:
+                self.http_server = _PlainHTTPServer(
+                    (config.plain_http.host or config.tls_host, config.plain_http.port), self)
+                self._servers.append(self.http_server)
+            self.ntp_server = None
+            if config.ntp is not None:
+                self.ntp_server = _NTPServer((config.ntp.host or config.dns_host, config.ntp.port), self)
+                self._servers.append(self.ntp_server)
         except BaseException:
             for server in reversed(self._servers):
                 server.server_close()
@@ -461,6 +721,14 @@ class JITCAService:
     @property
     def tls_address(self):
         return self.tls_server.server_address
+
+    @property
+    def http_address(self):
+        return self.http_server.server_address if self.http_server else None
+
+    @property
+    def ntp_address(self):
+        return self.ntp_server.server_address if self.ntp_server else None
 
     def _sni_callback(self, ssl_obj: ssl.SSLSocket, servername: str | None, initial: ssl.SSLContext):
         if servername:
@@ -522,14 +790,21 @@ class JITCAService:
             self._state = "running"
             try:
                 self.prewarmer.start()
-                for name, server in (("jitca-dns", self.dns_server), ("jitca-tls", self.tls_server)):
+                named = [("jitca-dns", self.dns_server), ("jitca-tls", self.tls_server)]
+                if self.http_server is not None:
+                    named.append(("jitca-http", self.http_server))
+                if self.ntp_server is not None:
+                    named.append(("jitca-ntp", self.ntp_server))
+                for name, server in named:
                     thread = threading.Thread(target=server.serve_forever,
                                               kwargs={"poll_interval": 0.1}, name=name, daemon=True)
                     thread.start()
                     self.threads.append(thread)
                     self._running_servers.append(server)
                 self._log_issuers()
-                self.log.emit("service_started", dns_address=self.dns_address, tls_address=self.tls_address)
+                self.log.emit("service_started", dns_address=self.dns_address,
+                              tls_address=self.tls_address, ntp_address=self.ntp_address,
+                              http_address=self.http_address)
             except BaseException:
                 self.stop()
                 raise

@@ -13,6 +13,30 @@ allowed_clients = ["127.0.0.1/32", "::1/128"]
 # (needs redirect_ipv4; never issues certificates for non-endpoint names):
 # dns_answer_all = true
 
+# Optional: relay DNS queries for these exact hostnames to a real resolver and return its
+# answer untouched (no redirect, no certificate). Everything else keeps the behaviour above.
+# Names must not also be [[endpoints]]. Failures/timeouts return SERVFAIL.
+# [dns_forward]
+# upstream = "192.168.88.2"
+# port = 53
+# timeout_seconds = 2
+# hostnames = ["cloud.vendor.example"]
+
+# Optional: answer SNTP (UDP) with this host's clock so a device with a bad RTC can pass TLS
+# validity checks. Honours network.allowed_clients. Port 123 is privileged; use a high port
+# and a port mapping/redirect if unprivileged. host defaults to network.dns_host.
+# [ntp]
+# port = 123
+# stratum = 2
+
+# Optional: cleartext HTTP/1.1 listener (a capture point for devices that call plain-HTTP
+# endpoints). Uses the same [[endpoints]] routes, event logging and [capture] as TLS, with the
+# virtual host taken from the Host header. host defaults to network.tls_host. Port 80 is
+# privileged; use a high port and a port mapping if unprivileged. Names with no endpoint are
+# logged/captured but only get an empty 204.
+# [plain_http]
+# port = 80
+
 [certificates]
 mode = "local"                  # use a locally generated DEMO CA
 state_dir = "./state"

@@ -381,3 +381,240 @@ def test_external_intermediate_chain(tmp_path):
         assert issued.not_valid_after_utc <= intermediate.not_valid_after_utc
     finally:
         service.stop()
+
+
+class _FakeUpstream:
+    """Loopback UDP resolver that answers every A query with 203.0.113.7 (or stays silent)."""
+
+    def __init__(self, silent=False):
+        import threading
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.settimeout(0.2)
+        self.port = self.sock.getsockname()[1]
+        self.silent, self.queries, self.running = silent, 0, True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while self.running:
+            try:
+                data, peer = self.sock.recvfrom(4096)
+            except OSError:
+                continue
+            self.queries += 1
+            if self.silent:
+                continue
+            question = data[12:]
+            reply = (data[:2] + struct.pack("!HHHHH", 0x8180, 1, 1, 0, 0) + question
+                     + b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + socket.inet_aton("203.0.113.7"))
+            self.sock.sendto(reply, peer)
+
+    def close(self):
+        self.running = False
+        self.thread.join()
+        self.sock.close()
+
+
+def _forward_config(tmp_path, upstream_port, hostnames='["cloud.vendor.test"]', extra=""):
+    path = config_file(tmp_path)
+    path.write_text(path.read_text() + f'''
+[dns_forward]
+upstream = "127.0.0.1"
+port = {upstream_port}
+timeout_seconds = 0.5
+hostnames = {hostnames}
+{extra}''')
+    return path
+
+
+def test_dns_forward_whitelisted_hostname_gets_real_answer(tmp_path):
+    upstream = _FakeUpstream()
+    server = JITCAService(load_config(_forward_config(tmp_path, upstream.port)))
+    server.start()
+    try:
+        reply = lookup(server.dns_address[1], "Cloud.Vendor.Test")
+        assert reply[:2] == struct.pack("!H", 0x4321)
+        assert reply[-4:] == socket.inet_aton("203.0.113.7")
+        assert upstream.queries == 1
+        # Not whitelisted: still REFUSED, never relayed, and no certificate issued.
+        assert struct.unpack("!H", lookup(server.dns_address[1], "other.vendor.test")[2:4])[0] & 0xF == 5
+        assert upstream.queries == 1
+        # Explicit endpoints are unchanged.
+        assert lookup(server.dns_address[1], "robot.example.test")[-4:] == socket.inet_aton("127.0.0.1")
+        server.prewarmer.queue.join()
+        assert [c["hostname"] for c in server.store.all_metadata()] == ["robot.example.test"]
+    finally:
+        server.stop()
+        upstream.close()
+    events = [json.loads(line) for line in (server.config.state_dir / "events.jsonl").read_text().splitlines()]
+    forwarded = [x for x in events if x["event"] == "dns_query" and x["action"] == "forward"]
+    assert len(forwarded) == 1 and forwarded[0]["hostname"] == "cloud.vendor.test"
+    assert forwarded[0]["upstream"] == f"127.0.0.1:{upstream.port}"
+    assert [(r["name"].lower(), r["type"], r["ttl"], r["data"]) for r in forwarded[0]["answers"]] == [
+        ("cloud.vendor.test", "A", 60, "203.0.113.7")]
+    assert forwarded[0]["rcode"] == "NOERROR" and forwarded[0]["reply_bytes"] > 12
+    assert forwarded[0]["truncated"] is False and forwarded[0]["answers_error"] is None
+
+
+def test_dns_forward_upstream_timeout_returns_servfail(tmp_path):
+    upstream = _FakeUpstream(silent=True)
+    server = JITCAService(load_config(_forward_config(tmp_path, upstream.port)))
+    server.start()
+    try:
+        reply = lookup(server.dns_address[1], "cloud.vendor.test")
+        assert struct.unpack("!H", reply[2:4])[0] & 0xF == 2
+        assert reply[:2] == struct.pack("!H", 0x4321)
+    finally:
+        server.stop()
+        upstream.close()
+    events = [json.loads(line) for line in (server.config.state_dir / "events.jsonl").read_text().splitlines()]
+    assert any(x.get("action") == "forward_failed" for x in events)
+
+
+def test_dns_forward_config_validation(tmp_path):
+    with pytest.raises(ValueError, match="overlap"):
+        load_config(_forward_config(tmp_path, 53, hostnames='["robot.example.test"]'))
+    other = tmp_path / "empty"
+    other.mkdir()
+    with pytest.raises(ValueError, match="non-empty"):
+        load_config(_forward_config(other, 53, hostnames="[]"))
+
+
+def _ntp_config(tmp_path, extra=""):
+    path = config_file(tmp_path)
+    path.write_text(path.read_text() + f'\n[ntp]\nport = 0\n{extra}')
+    return path
+
+
+def _ntp_request(port, mode=3, version=4, size=48):
+    packet = bytearray(size)
+    packet[0] = (version << 3) | mode
+    packet[40:48] = b"\x01\x02\x03\x04\x05\x06\x07\x08"
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(1)
+    try:
+        sock.sendto(bytes(packet), ("127.0.0.1", port))
+        return sock.recvfrom(1024)[0]
+    finally:
+        sock.close()
+
+
+def test_ntp_answers_client_request_with_current_time(tmp_path):
+    config = load_config(_ntp_config(tmp_path, "stratum = 3\n"))
+    server = JITCAService(config)
+    server.start()
+    try:
+        before = time.time()
+        reply = _ntp_request(server.ntp_address[1])
+        after = time.time()
+        assert len(reply) == 48
+        assert reply[0] & 7 == 4 and (reply[0] >> 3) & 7 == 4
+        assert reply[1] == 3
+        assert reply[24:32] == b"\x01\x02\x03\x04\x05\x06\x07\x08"
+        seconds, _ = struct.unpack("!II", reply[40:48])
+        assert before - 1 <= seconds - 2208988800 <= after + 1
+        # Server-mode packets, short packets and bad versions get no reply.
+        for bad in ({"mode": 4}, {"version": 0}, {"size": 20}):
+            with pytest.raises(socket.timeout):
+                _ntp_request(server.ntp_address[1], **bad)
+    finally:
+        server.stop()
+    events = [json.loads(line) for line in (config.state_dir / "events.jsonl").read_text().splitlines()]
+    assert sum(x["event"] == "ntp_query" for x in events) == 1
+    assert sum(x["event"] == "ntp_invalid" for x in events) == 3
+
+
+def test_ntp_disabled_by_default_and_validated(tmp_path):
+    server = JITCAService(load_config(config_file(tmp_path)))
+    try:
+        assert server.ntp_address is None
+    finally:
+        server.stop()
+    other = tmp_path / "bad"
+    other.mkdir()
+    with pytest.raises(ValueError, match="stratum"):
+        load_config(_ntp_config(other, "stratum = 16\n"))
+
+
+def _plain_config(tmp_path, extra=""):
+    path = config_file(tmp_path)
+    path.write_text(path.read_text() + f'\n[plain_http]\nport = 0\n[capture]\nenabled = true\n{extra}')
+    return path
+
+
+def _plain_request(port, method, path, host, body=b""):
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+        request = (f"{method} {path} HTTP/1.1\r\n" + (f"Host: {host}\r\n" if host else "")
+                   + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode() + body
+        sock.sendall(request)
+        response = b""
+        while data := sock.recv(8192):
+            response += data
+        return response
+
+
+def test_plain_http_routes_logs_and_captures_bodies(tmp_path):
+    config = load_config(_plain_config(tmp_path))
+    server = JITCAService(config)
+    server.start()
+    try:
+        port = server.http_address[1]
+        ok = _plain_request(port, "GET", "/status", "robot.example.test:80")
+        assert b"200 OK" in ok and b'"connected":true' in ok
+        secret = b"raw-device-payload"
+        # Unlisted host and IP-literal Host are observed (captured) but get an empty 204.
+        assert b"204 No Content" in _plain_request(port, "POST", "/up", "unlisted.example.test", secret)
+        assert b"204 No Content" in _plain_request(port, "POST", "/up", "10.1.2.3", secret)
+        assert b"204 No Content" in _plain_request(port, "POST", "/up", None, secret)
+    finally:
+        server.stop()
+    events = [json.loads(line) for line in (config.state_dir / "events.jsonl").read_text().splitlines()]
+    flows = [x for x in events if x["event"] == "http_flow"]
+    assert [x["status"] for x in flows] == [200, 204, 204, 204]
+    assert all(x["scheme"] == "http" for x in flows)
+    assert [x["hostname"] for x in flows] == ["robot.example.test", "unlisted.example.test", None, None]
+    assert flows[2]["host_header"] == "10.1.2.3"
+    captured = [x["request_capture"]["file"] for x in flows if "request_capture" in x]
+    assert len(captured) == 3
+    assert any("unknown-host" in name for name in captured)
+    for name in captured:
+        assert (config.state_dir / "captures" / name).read_bytes() == secret
+
+
+def test_plain_http_disabled_by_default_and_denies_other_clients(tmp_path):
+    server = JITCAService(load_config(config_file(tmp_path)))
+    try:
+        assert server.http_address is None
+    finally:
+        server.stop()
+    other = tmp_path / "deny"
+    other.mkdir()
+    path = _plain_config(other)
+    path.write_text(path.read_text().replace('allowed_clients = ["127.0.0.1/32"]',
+                                             'allowed_clients = ["192.0.2.0/24"]'))
+    config = load_config(path)
+    server = JITCAService(config)
+    server.start()
+    try:
+        with socket.create_connection(("127.0.0.1", server.http_address[1]), timeout=2) as sock:
+            sock.sendall(b"GET / HTTP/1.1\r\nHost: robot.example.test\r\n\r\n")
+            assert sock.recv(100) == b""
+    finally:
+        server.stop()
+    events = (config.state_dir / "events.jsonl").read_text()
+    assert "http_plain_denied" in events and "http_flow" not in events
+
+
+def test_parse_dns_answers_handles_cname_aaaa_and_malformed():
+    from jitca.service import _parse_dns_answers
+    header = struct.pack("!HHHHHH", 1, 0x8180, 1, 3, 0, 0)
+    question = b"\x05cloud\x06vendor\x04test\x00" + struct.pack("!HH", 1, 1)
+    cname = b"\xc0\x0c" + struct.pack("!HHIH", 5, 1, 30, 7) + b"\x04edge\xc0\x12"
+    a = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + socket.inet_aton("198.51.100.9")
+    aaaa = b"\xc0\x0c" + struct.pack("!HHIH", 28, 1, 60, 16) + socket.inet_pton(socket.AF_INET6, "2001:db8::1")
+    records = _parse_dns_answers(header + question + cname + a + aaaa)
+    assert [(r["type"], r["data"]) for r in records] == [
+        ("CNAME", "edge.vendor.test"), ("A", "198.51.100.9"), ("AAAA", "2001:db8::1")]
+    with pytest.raises(ValueError):
+        _parse_dns_answers((header + question + cname)[:-3])
